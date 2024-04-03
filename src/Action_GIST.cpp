@@ -10,12 +10,11 @@
 #include "ProgressBar.h"
 #include "StringRoutines.h"
 #include "DistRoutines.h"
+#include "TorsionRoutines.h" // calcAngle
 #include "GistEntropyUtils.h"
 #ifdef _OPENMP
 # include <omp.h>
 #endif
-
-using namespace Cpptraj;
 
 // Note: The Order calculation is not updated for solvents other than water.
 // E.g., it does not use rigidAtomIndices[0].
@@ -68,14 +67,15 @@ Action_GIST::Action_GIST() :
   gridspacing_(0),
   gridcntr_(0.0),
   griddim_(),
-  masterGrid_(0),
-  gridBin_(0),
-  use_PL_(true),
-  PL_active_(false),
-  PL_cut_(10.0),
   rigidAtomNames_(3),
   Esw_(0),
   Eww_(0),
+  sw_Acc_(0),
+  sw_Don_(0),
+  ww_Acc_(0),
+  ww_Don_(0),
+  dcut2_(0),
+  acut_(0),
   dTStrans_(0),
   dTSorient_(0),
   dTSsix_(0),
@@ -88,6 +88,7 @@ Action_GIST::Action_GIST() :
   PME_(0),
   U_PME_(0),
   ww_Eij_(0),
+  G_max_(0.0),
   CurrentParm_(0),
   datafile_(0),
   eijfile_(0),
@@ -106,24 +107,19 @@ Action_GIST::Action_GIST() :
   NFRAME_(0),
   max_nwat_(0),
   n_linear_solvents_(0),
-# ifdef DEBUG_GIST
-  debugOut_(0),
-# endif
   doOrder_(false),
   doEij_(false),
   skipE_(false),
+  hbond_(false),
   exactNnVolume_(false),
   useCom_(true),
-  setupSuccessful_(false),
-  watCountSubvol_(-1)
+  setupSuccessful_(false)
 {}
 
 /** GIST help */
 void Action_GIST::Help() const {
-  mprintf("\t[name <dataset name>] [doorder [nopl] [plcut <plcut>]]\n"
-          "\t[doeij] [skipE] [skipS] [refdens <rdval>] [temp <tval>]\n"
+  mprintf("\t[doorder] [doeij] [skipE] [skipS] [hbond] [refdens <rdval>] [temp <tval>]\n"
           "\t[noimage] [gridcntr <xval> <yval> <zval>]\n"
-          "\t[rmsfit <fitmask>]\n"
           "\t[griddim <nx> <ny> <nz>] [gridspacn <spaceval>] [neighborcut <ncut>]\n"
           "\t[prefix <filename prefix>] [ext <grid extension>] [out <output suffix>]\n"
           "\t[floatfmt {double|scientific|general}] [floatwidth <fw>] [floatprec <fp>]\n"
@@ -141,32 +137,21 @@ void Action_GIST::Help() const {
           );
 }
 
-// DEBUG MPI
-//static CpptrajFile* debugOut_ = 0;
-
-// DEBUG MPI
-//Action_GIST::~Action_GIST() { /*if (debugOut_ != 0) {debugOut_->CloseFile(); delete debugOut_; }* }
-
 /** Init GIST action. */
 Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int debugIn)
 {
+  mprintf("\t in init action, line 143\n");
   debug_ = debugIn;
   DFL_ = &init.DFL();
   DSL_ = init.DslPtr();
 # ifdef MPI
-  trajComm_ = init.TrajComm();
-  mover_.MoverSetComm(init.TrajComm());
-//  debugOut_ = new CpptrajFile(); // DEBUG MPI
-//  debugOut_->OpenWrite( "rank." + integerToString(trajComm_.Rank()) ); // DEBUG MPI
+  if (init.TrajComm().Size() > 1) {
+    mprinterr("Error: 'gist' action does not work with > 1 process (%i processes currently).\n",
+              init.TrajComm().Size());
+    return Action::ERR;
+  }
 # endif
   gist_init_.Start();
-# ifdef DEBUG_GIST
-  debugOut_ = init.DFL().AddCpptrajFile(actionArgs.GetStringKey("debugout"), "GIST debug");
-# else
-  std::string debugOut = actionArgs.GetStringKey("debugout");
-  if (!debugOut.empty())
-    mprintf("Warning: 'debugout' requires compiling with DEBUG_GIST. Ignoring.\n");
-# endif
   prefix_ = actionArgs.GetStringKey("prefix", "gist");
   ext_ = actionArgs.GetStringKey("ext", ".dx");
   std::string gistout = actionArgs.GetStringKey("out", prefix_ + "-output.dat");
@@ -192,24 +177,25 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
       return Action::ERR;
     }
   }
+  mprintf("\t in init action, line 180\n");
   fltFmt_.SetFormatWidthPrecision( actionArgs.getKeyInt("floatwidth", 0),
                                    actionArgs.getKeyInt("floatprec", -1) );
   intFmt_.SetFormatWidth( actionArgs.getKeyInt("intwidth", 0) );
-  // Other keywords
+  mprintf("\t in init action, line 184\n");// Other keywords
   double neighborCut = actionArgs.getKeyDouble("neighborcut", 3.5);
   NeighborCut2_ = neighborCut * neighborCut;
   exactNnVolume_ = !actionArgs.hasKey("oldnnvolume");
   nNnSearchLayers_ = actionArgs.getKeyInt("nnsearchlayers", 1);
+  mprintf("\t in init action, line 189\n");
   imageOpt_.InitImaging( !(actionArgs.hasKey("noimage")), actionArgs.hasKey("nonortho") );
+  mprintf("\t in init action, line 191\n");
   doOrder_ = actionArgs.hasKey("doorder");
-  if (doOrder_) {
-    use_PL_ = !actionArgs.hasKey("nopl");
-    PL_cut_ = actionArgs.getKeyDouble("plcut", 10.0);
-  } else {
-    use_PL_ = false;
-  }
+  mprintf("\t in init action, line 193 %d\n", doEij_);
   doEij_ = actionArgs.hasKey("doeij");
+  mprintf("\t in init action, line 195 %d\n", hbond_);
+  hbond_ = actionArgs.hasKey("hbond");
   useCom_ = !actionArgs.hasKey("nocom");
+  mprintf("\t after Hbondflag set, line 198 %d\n", hbond_);
 #ifdef CUDA
   if (this->doEij_) {
     mprinterr("Error: 'doeij' cannot be specified when using CUDA.\n");
@@ -220,19 +206,6 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
   if (skipE_) {
     if (doEij_) {
       mprinterr("Error: 'doeij' cannot be specified if 'skipE' is specified.\n");
-      return Action::ERR;
-    }
-  }
-  // Grid move options
-  std::string rmsfitmask = actionArgs.GetStringKey("rmsfit");
-  if (!rmsfitmask.empty()) {
-    if ( moveMask_.SetMaskString( rmsfitmask )) {
-      mprinterr("Error: Bad mask string: '%s'\n", rmsfitmask.c_str());
-      return Action::ERR;
-    }
-    // Rms fit grid, x-align after
-    if (mover_.MoverInit( GridMover::RMS_FIT, true )) {
-      mprinterr("Error: Could not initialize grid mover.\n");
       return Action::ERR;
     }
   }
@@ -274,6 +247,29 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
   if (doEij_) {
     eijfile_ = init.DFL().AddCpptrajFile(prefix_ + "-Eww_ij.dat", "GIST Eij matrix file");
     if (eijfile_ == 0) return Action::ERR;
+  }
+  
+  DataFile* file_Nsw_A = 0;
+  DataFile* file_Nsw_D = 0;
+  DataFile* file_Nww_A = 0;
+  DataFile* file_Nww_D = 0;
+  if (hbond_) {
+     /// key word for hbond analysis
+    mprintf("\t in hbond setup 1, line 258\n");
+    acut_ = actionArgs.getKeyDouble("angle",135.0);
+    acut_ *= Constants::DEGRAD;
+    double dcut;  
+    dcut= actionArgs.getKeyDouble("dist",3.0);
+    dcut2_=dcut * dcut;
+    SolventDonorMask_.SetMaskString(":WAT");
+    SolventAcceptorMask_.SetMaskString(":WAT@O");
+    Mask_.SetMaskString(":*");
+    AcceptorMask_.SetMaskString(":*");
+    file_Nsw_A = init.DFL().AddDataFile(prefix_ + "-Nsw_acceptor" +ext_);
+    file_Nsw_D = init.DFL().AddDataFile(prefix_ + "-Nsw_donor"+ext_);
+    file_Nww_A = init.DFL().AddDataFile(prefix_ +"-Nww_acceptor" + ext_);
+    file_Nww_D = init.DFL().AddDataFile(prefix_ +"-Nww_donor" + ext_);
+    mprintf("\t end hbond setup 1, line 272\n");
   }
   // Set Bulk Density 55.5M
   BULK_DENS_ = actionArgs.getKeyDouble("refdens", 0.0334);
@@ -348,7 +344,15 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
   dipolex_ = AddDatasetAndFile("dipolex", prefix_ + "-dipolex-dens" + ext_, DataSet::GRID_DBL);
   dipoley_ = AddDatasetAndFile("dipoley", prefix_ + "-dipoley-dens" + ext_, DataSet::GRID_DBL);
   dipolez_ = AddDatasetAndFile("dipolez", prefix_ + "-dipolez-dens" + ext_, DataSet::GRID_DBL);
-
+  if (hbond_) {
+    mprintf("\t in hbond setup 2, line 348\n");
+    sw_Don_ = AddDatasetAndFile("sw-hbond", prefix_ + "-donor-dens" + ext_, DataSet::GRID_DBL);
+    sw_Acc_ = AddDatasetAndFile("sw-hbond", prefix_ + "-acceptor-dens" + ext_, DataSet::GRID_DBL);
+    ww_Don_ = AddDatasetAndFile("ww-hbond", prefix_ + "-donor-dens" + ext_, DataSet::GRID_DBL);
+    ww_Acc_ = AddDatasetAndFile("ww-hbond", prefix_ + "-acceptor-dens" + ext_, DataSet::GRID_DBL);
+    mprintf("\t end hbond setup 2, line 353\n");
+  }
+    
   if (!Esw_ || !Eww_ || !dTStrans_ || !dTSorient_ || !dTSsix_ || !neighbor_ || !dipole_ || !order_
       || !dipolex_ || !dipoley_ || !dipolez_) {
     return Action::ERR;
@@ -367,21 +371,8 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
     mprinterr("Failed to create datasets for molecular densities;\n");
     return Action::ERR;
   }
-  // The master grid is the one that will be used for all voxel calcs.
-  masterGrid_ = Eww_;
-  gridBin_ = &(Eww_->Bin());
 
-  // Allocate a border grid (the grid + 1.5 Ang buffer) for
-  // determining when things are near the grid. TODO handle nonortho shape case
-  borderGrid_.Setup_Lengths_Center_Spacing( Vec3(gridBin_->GridBox().Param(Box::X)+3.0,
-                                                 gridBin_->GridBox().Param(Box::Y)+3.0,
-                                                 gridBin_->GridBox().Param(Box::Z)+3.0),
-                                            gridBin_->GridCenter(),
-                                            Vec3( gridspacing_ ) );
-  if (debug_ > 0)
-    borderGrid_.PrintDebug("borderGrid"); // DEBUG
-  // Save initial border grid vectors
-  borderGridUcell0_ = borderGrid_.GridBox().UnitCell();
+  gridBin_ = &Eww_->Bin();
 
   if (doEij_) {
     ww_Eij_ = (DataSet_MatrixFlt*)init.DSL().AddSet(DataSet::MATRIX_FLT, MetaData(dsname_, "Eij"));
@@ -397,7 +388,10 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
     }
   }
 
-  // Init arrays 
+  // Set up grid params TODO non-orthogonal as well
+  G_max_ = Vec3( (double)griddim_[0] * gridspacing_ + 1.5,
+                 (double)griddim_[1] * gridspacing_ + 1.5,
+                 (double)griddim_[2] * gridspacing_ + 1.5 );
   N_solvent_.assign( MAX_GRID_PT_, 0 );
   N_main_solvent_.assign( MAX_GRID_PT_, 0 );
   N_solute_atoms_.assign( MAX_GRID_PT_, 0);
@@ -440,20 +434,26 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
     #endif
   }
 
+  //Box gbox;
+  //gbox.SetBetaLengths( 90.0, (double)nx * gridspacing_,
+  //                           (double)ny * gridspacing_,
+  //                           (double)nz * gridspacing_ );
+  //grid_.Setup_O_Box( nx, ny, nz, gO_->GridOrigin(), gbox );
+  //grid_.Setup_O_D( nx, ny, nz, gO_->GridOrigin(), v_spacing );
+
   mprintf("    GIST:\n");
   mprintf("\tOutput prefix= '%s', grid output extension= '%s'\n", prefix_.c_str(), ext_.c_str());
   mprintf("\tOutput float format string= '%s', output integer format string= '%s'\n", fltFmt_.fmt(), intFmt_.fmt());
   mprintf("\tGIST info written to '%s'\n", infofile_->Filename().full());
   mprintf("\tName for data sets: %s\n", dsname_.c_str());
-  if (doOrder_) {
+  if (doOrder_)
     mprintf("\tDoing order calculation.\n");
-    if (use_PL_) {
-      mprintf("\t  Using pair list if possible.\n");
-      mprintf("\t  Pair list cutoff is %.3f Ang.\n", PL_cut_);
-    } else
-      mprintf("\t  Not using pair list.\n");
-  } else
+  else
     mprintf("\tSkipping order calculation.\n");
+  if (hbond_)
+    mprintf("\tDoing hydrogen bond analysis.\n");
+  else
+    mprintf("\tSkipping hydrogen bond analysis\n");
   if (skipE_)
     mprintf("\tSkipping energy calculation.\n");
   else {
@@ -488,8 +488,6 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
     mprintf("\tVoxel occupancy will be determined using molecule center of mass.\n");
   else
     mprintf("\tVoxel occupancy will be determined using the first atom.\n");
-  if (mover_.NeedsMove())
-    mover_.MoverInfo(moveMask_);
   mprintf("#Please cite these papers if you use GIST results in a publication:\n"
           "#    Steven Ramsey, Crystal Nguyen, Romelia Salomon-Ferrer, Ross C. Walker, Michael K. Gilson, and Tom Kurtzman. J. Comp. Chem. 37 (21) 2016\n"
           "#    Franz Waibl, Johannes Kraml, Valentin J. Hoerschinger, Florian Hofer, Anna S. Kamenik, Monica L. Fernandez-Quintero, and Klaus R. Liedl,\n"
@@ -646,21 +644,6 @@ Action::RetType Action_GIST::Setup(ActionSetup& setup) {
     mprintf("Warning: Less than 5 solvent molecules. Cannot perform order calculation.\n");
     doOrder_ = false;
   }
-  PL_active_ = false;
-  if (doOrder_ && use_PL_) {
-    if (imageOpt_.ImagingEnabled()) {
-      // TODO make cutoff user specifiable
-      if (pairList_.InitPairList( PL_cut_, 0.1, debug_ )) {
-        mprinterr("Error: Could not init pair list.\n");
-        return Action::ERR;
-      }
-      if (pairList_.SetupPairList( setup.CoordInfo().TrajBox() )) {
-        mprinterr("Error: Could not setup pair list.\n");
-        return Action::ERR;
-      }
-      PL_active_ = true;
-    }
-  } 
   // Allocate space for saving indices of water atoms that are on the grid
   // Estimate how many solvent molecules can possibly fit onto the grid.
   // Add some extra voxels as a buffer.
@@ -677,19 +660,6 @@ Action::RetType Action_GIST::Setup(ActionSetup& setup) {
       mprintf("\tImaging enabled for energy distance calculations.\n");
     else
       mprintf("\tNo imaging will be performed for energy distance calculations.\n");
-  }
-
-  // Set up movement if needed
-  if (mover_.NeedsMove()) {
-    if (setup.Top().SetupIntegerMask( moveMask_ )) {
-      mprinterr("Error: Could not set up grid move mask.\n");
-      return Action::ERR;
-    }
-    moveMask_.MaskInfo();
-    if (mover_.MoverSetup( setup.Top(), moveMask_ )) {
-      mprinterr("Error: Could not set up grid movement.\n");
-      return Action::ERR;
-    }
   }
 
 #ifdef CUDA
@@ -724,6 +694,179 @@ Action::RetType Action_GIST::Setup(ActionSetup& setup) {
   }
 #endif
 
+  if (hbond_){
+
+    // --- initianize Hbond analysis
+    mprintf("total atom number [%i] \n", setup.Top().Natom());
+    //Mask_ = AtomMask(0, setup.Top().Natom());
+    //mprintf("convert Mask_ to char [%s]", Mask_.ConvertToCharMask());
+    //mprintf("Mask_ is [%s], number of atom in Mask_ is [%i] \n", Mask_.MaskString(), Mask_.NmaskAtoms());
+    setup.Top().SetupIntegerMask( Mask_ );   //!!! problem is here!!!!
+
+    AcceptorMask_.ResetMask();
+    //mprintf("solute residue mask [%s] \n", Mask_.MaskString());
+    for (AtomMask::const_iterator at = Mask_.begin(); at != Mask_.end(); ++at) {
+       //mprintf("looping");
+      // Since an acceptor mask was not specified ignore solvent.
+      int molnum = setup.Top()[*at].MolNum();
+    
+      if (!setup.Top().Mol(molnum).IsSolvent() && IsFON( setup.Top()[*at] ))
+      {
+        //mprintf("find");
+         AcceptorMask_.AddSelectedAtom( *at );
+        //mprintf("Acceptor mask atom number [%s] \n", AcceptorMask_.NmaskAtoms());
+      }
+
+      AcceptorMask_.SetNatoms( Mask_.NmaskAtoms() );
+    
+    }
+
+    if ( AcceptorMask_.None() ) {
+       mprintf("Warning: AcceptorMask_ has no atoms.\n");
+    }
+  
+  
+    //mprintf("Acceptor mask for solute atoms [%s] \n", AcceptorMask_.MaskString());
+
+    Both_.clear();
+    Acceptor_.clear();
+    SolventSites_.clear(); 
+
+    // --------SOLUTE DONOR/ACCEPTOR SITE SETUP-------
+
+    Sarray donorOnly;
+   // No specified donor mask; search generic mask.
+    int lastAcceptor = -1;
+    if (!AcceptorMask_.None())
+    lastAcceptor = AcceptorMask_.back();
+    int maxAtom = std::max( lastAcceptor, Mask_.back() ) + 1;
+    AtomMask::const_iterator a_atom = AcceptorMask_.begin();
+    AtomMask::const_iterator d_atom = Mask_.begin();
+    bool isDonor, isAcceptor;
+    for (int at = 0; at != maxAtom; at++)
+    {
+      // Since an acceptor mask was not specified ignore solvent.
+     Atom const& atom = setup.Top()[at];
+      int molnum = atom.MolNum();
+      if (!setup.Top().Mol(molnum).IsSolvent())
+      {
+        Iarray Hatoms;
+        isDonor = false;
+        isAcceptor = false;
+        if ( d_atom != Mask_.end() && *d_atom == at) {
+          ++d_atom;
+          ///-> Check if the FON atom are covalently bonded to hydrogen to determine the atom is donor_only, acceptor_only or Both
+          if ( IsFON( atom ) ) {              
+            for (Atom::bond_iterator H_at = atom.bondbegin();
+                                     H_at != atom.bondend(); ++H_at)
+            if (setup.Top()[*H_at].Element() == Atom::HYDROGEN)
+              Hatoms.push_back( *H_at );
+            isDonor = !Hatoms.empty();
+          }
+        }
+        if ( a_atom != AcceptorMask_.end() && *a_atom == at ) {
+          isAcceptor = true;
+          ++a_atom;
+        }
+        if (isDonor && isAcceptor)
+        {
+          Both_.push_back( Site(at, Hatoms) );
+          //mprintf("h atom number %i for solute atom %s ,with idx: %i \n", Hatoms.size(),atom.c_str(),at);
+
+        }
+
+        else if (isDonor)
+          donorOnly.push_back( Site(at, Hatoms) );
+        else if (isAcceptor)
+          Acceptor_.push_back( at );
+      }
+    }
+  
+    // Place donor-only sites at the end of Both_
+    bothEnd_ = Both_.size();
+    for (Sarray::const_iterator site = donorOnly.begin(); site != donorOnly.end(); ++site)
+    Both_.push_back( *site );
+
+    // Print solute site stats
+    mprintf("\tAcceptor-only solute atom#: %zu\n", Acceptor_.size());
+    mprintf("\tDonor/acceptor solute sites#: %u\n", bothEnd_);
+    mprintf("\tDonor-on;y solute atoms#: %zu\n", (Both_.size()-bothEnd_));
+
+    Sarray::const_iterator END = Both_.begin() + bothEnd_;
+  
+  
+    // number of hygrogen atoms in solute
+    unsigned int hcount = 0;
+    for (Sarray::const_iterator si = Both_.begin(); si != END; ++si)
+    {
+      //mprintf("[%i] hydrogen in this solute site \n", si->n_hydrogens());
+      hcount += si->n_hydrogens();
+    
+    }
+    mprintf("\t%u solute hydrogens.\n", hcount);
+
+
+    //------- Solvent Site Setup--------------------
+    
+    int at_beg = 0;
+    int at_end = 0;
+    setup.Top().SetupIntegerMask( SolventDonorMask_ );
+    setup.Top().SetupIntegerMask( SolventAcceptorMask_ );
+    mprintf("\tWill search for hbonds between solute and solvent acceptors in [%s]\n",
+            SolventAcceptorMask_.MaskString());
+  
+    mprintf("\tWill search for hbonds between solute and solvent donors in [%s]\n",
+            SolventDonorMask_.MaskString());
+  
+    at_beg = std::min( SolventDonorMask_[0], SolventAcceptorMask_[0] );
+    at_end = std::max( SolventDonorMask_.back(), SolventAcceptorMask_.back() ) + 1;
+
+    AtomMask::const_iterator A_atom = SolventAcceptorMask_.begin();
+    AtomMask::const_iterator D_atom = SolventDonorMask_.begin();
+
+    for (int at = at_beg; at != at_end; at++)
+    {
+      Iarray Hatoms;
+      isDonor = false;
+      isAcceptor = false;
+      if ( D_atom != SolventDonorMask_.end() && *D_atom == at ) {
+        ++D_atom;
+        Atom const& atom = setup.Top()[at];
+        //mprintf("atom name is [%s] \n", atom.c_str());
+        if ( IsFON( atom ) ) {
+          for (Atom::bond_iterator H_at = atom.bondbegin();
+                                   H_at != atom.bondend(); ++H_at)
+            if (setup.Top()[*H_at].Element() == Atom::HYDROGEN)
+              Hatoms.push_back( *H_at );
+        } else if ( atom.Nbonds() == 0 ) {
+          // If no bonds to this atom assume it is an ion. Set the H atom
+          // to be the same as D atom; this will skip the angle calc.
+          Hatoms.push_back( at );
+        }
+        isDonor = !Hatoms.empty();
+      }
+      if ( A_atom != SolventAcceptorMask_.end() && *A_atom == at ) {
+        isAcceptor = true;
+        ++A_atom;
+      }
+      if (isDonor || isAcceptor)
+      {
+        SolventSites_.push_back( Site(at, Hatoms) );
+        //mprintf("h atom number %i for atom %s ,with idx: %i \n", Hatoms.size(),setup.Top()[at].c_str(),at);
+      }
+    }
+
+    hcount = 0;
+    unsigned int icount = 0;
+    mprintf("\tSolvent sites (%zu)\n", SolventSites_.size());
+    for (Sarray::const_iterator si = SolventSites_.begin(); si != SolventSites_.end(); ++si) {
+      if (si->IsIon())
+        icount++;
+      else
+        hcount += si->n_hydrogens();
+    }
+    mprintf("\t%u solvent hydrogens, %u ions.\n", hcount, icount);
+  }
   /* for (int i = 0; i < setup.Top().Natom(); ++i) { */
   /*   mprintf("%d\n", solventType_[i]); */
   /* } */
@@ -1234,144 +1377,6 @@ void Action_GIST::NonbondEnergy(Frame const& frameIn, Topology const& topIn)
 # endif
 }
 
-/** The pairlist distance calc is idx1 - idx0. The original order calculation
-  * for each on-grid solvent molecule is done with idx0 as that solvent
-  * molecule. This routine corrects for that since the ordering is not
-  * guaranteed.
-  */
-static inline void  order_pl_insert(Vec3 const& dxyz, std::vector< std::set<Vec3> >& Wat_Distances,
-                                    bool ongrid0, bool ongrid1, int idx0, int idx1)
-{
-  if (ongrid0)
-    // idx0 on grid.
-    Wat_Distances[idx0].insert( dxyz );
-  if (ongrid1)
-    // idx1 on grid. Negate.
-    Wat_Distances[idx1].insert( dxyz.Negative() );
-}
-
-/** GIST order calculation with pair list. */
-void Action_GIST::Order_PL(Frame const& frameIn) {
-  int retVel = pairList_.CreatePairList( frameIn,
-                                         frameIn.BoxCrd().UnitCell(),
-                                         frameIn.BoxCrd().FracCell(),
-                                         AtomMask(O_idxs_, atom_voxel_.size()) );
-  if (retVel < 0) {
-    mprinterr("Error: Grid setup failed for order calculation.\n");
-    return;
-  }
-  // Hold list of distance vectors to on-grid water, sorted by distance
-  typedef std::set<Vec3> Vset;
-  // Hold distances for each on grid water
-  std::vector<Vset> Wat_Distances( O_idxs_.size() );
-  // Loop over PL cells
-  for (int cidx = 0; cidx < pairList_.NGridMax(); cidx++)
-  {
-    PairList::CellType const& thisCell = pairList_.Cell( cidx );
-    // cellList contains this cell index and all neighbors
-    PairList::Iarray const& cellList = thisCell.CellList();
-    // transList contains index to translation for the neighbors
-    PairList::Iarray const& transList = thisCell.TransList();
-    // Loop over all atoms of thisCell
-    for (PairList::CellType::const_iterator it0 = thisCell.begin();
-                                            it0 != thisCell.end(); ++it0)
-    {
-      int oidx0 = O_idxs_[it0->Idx()];
-      int voxel0 = atom_voxel_[oidx0];
-      bool ongrid0 = voxel0 != OFF_GRID_;
-      Vec3 const& xyz0 = it0->ImageCoords();
-//      mprintf("DEBUG: Index %8i atom %8i (vox=%i).\n", it0->Idx(), oidx0, voxel0);
-      // Loop over all other atoms of thisCell
-      for (PairList::CellType::const_iterator it1 = it0 + 1;
-                                              it1 != thisCell.end(); ++it1)
-      {
-        int oidx1 = O_idxs_[it1->Idx()];
-        int voxel1 = atom_voxel_[oidx1];
-        bool ongrid1 = voxel1 != OFF_GRID_;
-        if (ongrid0 || ongrid1) {
-          Vec3 const& xyz1 = it1->ImageCoords();
-          Vec3 dxyz = xyz1 - xyz0;
-//          double dist2 = dxyz.Magnitude2();
-//          mprintf("\tto %8i dist2= %8.3f (same cell)\n", oidx1, dist2);
-          order_pl_insert(dxyz, Wat_Distances, ongrid0, ongrid1, it0->Idx(), it1->Idx());
-        }
-      }
-      // Loop over all neighbor cells
-      for (unsigned int nidx = 1; nidx != cellList.size(); nidx++)
-      {
-        PairList::CellType const& nbrCell = pairList_.Cell( cellList[nidx] );
-        // Translate vector for neighbor cell
-        Vec3 const& tVec = pairList_.TransVec( transList[nidx] );
-        // Loop over every atom in nbrCell
-        for (PairList::CellType::const_iterator it1 = nbrCell.begin();
-                                                it1 != nbrCell.end(); ++it1)
-        {
-          int oidx1 = O_idxs_[it1->Idx()];
-          int voxel1 = atom_voxel_[oidx1]; 
-          bool ongrid1 = voxel1 != OFF_GRID_;
-          if (ongrid0 || ongrid1) {
-            Vec3 xyz1 = it1->ImageCoords() + tVec;
-            Vec3 dxyz = xyz1 - xyz0;
-//            double dist2 = dxyz.Magnitude2();
-//            mprintf("\tto %8i (vox=%i) dist2= %8.3f (diff cell)\n", oidx1, voxel1, dist2);
-            order_pl_insert(dxyz, Wat_Distances, ongrid0, ongrid1, it0->Idx(), it1->Idx());
-          }
-        } // END loop over atoms in nbrCell
-      } // END loop over neighbor cells
-    } // END loop over atoms in thisCell
-  } // END loop over cells
-  // DEBUG print distances
-/*  for (unsigned int idx = 0; idx < O_idxs_.size(); idx++) {
-    if (!Wat_Distances[idx].empty()) {
-      mprintf("%8i", O_idxs_[idx]);
-      for (Vset::const_iterator it = Wat_Distances[idx].begin(); it != Wat_Distances[idx].end(); ++it)
-        mprintf(" %8.3f", it->Magnitude2());
-      mprintf("\n");
-    }
-  }*/
-  // Do the order calculation for each voxel
-  for (unsigned int idx = 0; idx < O_idxs_.size(); idx++) {
-    if (!Wat_Distances[idx].empty()) {
-      int oidx = O_idxs_[idx];
-      int voxel = atom_voxel_[oidx];
-      if (Wat_Distances[idx].size() < 4) {
-        mprinterr("Error: Less than 4 waters close to water with atom %i, cannot do order calc.\n", oidx+1);
-        mprinterr("Error: Try increasing the pair list cutoff.\n");
-      } else {
-        std::vector<Vec3> WAT;
-        WAT.reserve(4);
-        for (Vset::const_iterator it = Wat_Distances[idx].begin(); it != Wat_Distances[idx].end(); ++it) {
-          WAT.push_back( *it );
-          if (WAT.size() == 4) break;
-        }
-        // Compute the tetrahedral order parameter
-        double sum = 0.0;
-        for (int mol1 = 0; mol1 < 3; mol1++) {
-          for (int mol2 = mol1 + 1; mol2 < 4; mol2++) {
-            Vec3 const& v1 = WAT[mol1];
-            Vec3 const& v2 = WAT[mol2];
-#           ifdef DEBUG_GIST
-            if (debugOut_ != 0) debugOut_->Printf("\t\t{%8.3f %8.3f %8.3f} * {%8.3f %8.3f %8.3f}\n", v1[0], v1[1], v1[2], v2[0], v2[1], v2[2]);
-#           endif
-            double r1 = v1.Magnitude2();
-            double r2 = v2.Magnitude2();
-            double cos = (v1* v2) / sqrt(r1 * r2);
-            sum += (cos + 1.0/3)*(cos + 1.0/3);
-          }
-        }
-        order_->UpdateVoxel(voxel, (1.0 - (3.0/8)*sum));
-#       ifdef DEBUG_GIST
-        if (debugOut_ != 0) {
-          debugOut_->Printf("Order: oidx1=%8i  voxel1= %8i  sum= %g\n", oidx, voxel, sum);
-          //debugOut_->Printf("Order indices: %8i %8i %8i %8i\n", IDX[0], IDX[1], IDX[2], IDX[3]);
-          debugOut_->Printf("Order dist2  : %8.3f %8.3f %8.3f %8.3f\n", WAT[0].Magnitude2(), WAT[1].Magnitude2(), WAT[2].Magnitude2(), WAT[3].Magnitude2());
-        }
-#       endif
-      }
-    }
-  } // END loop over waters
-}
-  
 /** GIST order calculation. */
 void Action_GIST::Order(Frame const& frameIn) {
   // Loop over all solvent molecules that are on the grid
@@ -1380,18 +1385,12 @@ void Action_GIST::Order(Frame const& frameIn) {
     int oidx1 = OnGrid_idxs_[gidx];
     if (!isMainSolvent(oidx1)) { continue; }
     int voxel1 = atom_voxel_[oidx1];
-//    mprintf("DEBUG: Index %8u atom %8i.\n", gidx, oidx1);
     Vec3 XYZ1( (&OnGrid_XYZ_[0])+gidx*3 );
     // Find coordinates for 4 closest neighbors to this water (on or off grid).
     // TODO set up overall grid in DoAction.
     Vec3 WAT[4];
     for (int ii = 0; ii < 4; ii++)
       WAT[ii].Zero();
-#   ifdef DEBUG_GIST
-    int IDX[4];
-    for (int ii = 0; ii < 4; ii++)
-      IDX[ii] = -1;
-#   endif
     double d1 = maxD_;
     double d2 = maxD_;
     double d3 = maxD_;
@@ -1401,49 +1400,29 @@ void Action_GIST::Order(Frame const& frameIn) {
       int oidx2 = O_idxs_[sidx2];
       if (isMainSolvent(oidx2) && oidx2 != oidx1)
       {
-        // Get coordinates of closest image of other solvent to this solvent
-        double dist2;
-        Vec3 XYZ2 = MinImagedCoords(dist2, imageOpt_.ImagingType(),
-                                    XYZ1, Vec3(frameIn.XYZ(oidx2)), frameIn.BoxCrd());
-//        mprintf("\tto %8i dist2= %8.3f\n", oidx2, dist2);
-//        const double* XYZ2 = frameIn.XYZ( oidx2 );
-//        double dist2 = DIST2_NoImage( XYZ1.Dptr(), XYZ2 );
+        const double* XYZ2 = frameIn.XYZ( oidx2 );
+        double dist2 = DIST2_NoImage( XYZ1.Dptr(), XYZ2 );
         if        (dist2 < d1) {
           d4 = d3; d3 = d2; d2 = d1; d1 = dist2;
           WAT[3] = WAT[2]; WAT[2] = WAT[1]; WAT[1] = WAT[0]; WAT[0] = XYZ2;
-#         ifdef DEBUG_GIST
-          IDX[3] = IDX[2]; IDX[2] = IDX[1]; IDX[1] = IDX[0]; IDX[0] = oidx2;
-#         endif
         } else if (dist2 < d2) {
           d4 = d3; d3 = d2; d2 = dist2;
           WAT[3] = WAT[2]; WAT[2] = WAT[1]; WAT[1] = XYZ2;
-#         ifdef DEBUG_GIST
-          IDX[3] = IDX[2]; IDX[2] = IDX[1]; IDX[1] = oidx2;
-#         endif
         } else if (dist2 < d3) {
           d4 = d3; d3 = dist2;
           WAT[3] = WAT[2]; WAT[2] = XYZ2;
-#         ifdef DEBUG_GIST
-          IDX[3] = IDX[2]; IDX[2] = oidx2;
-#         endif
         } else if (dist2 < d4) {
           d4 = dist2;
           WAT[3] = XYZ2;
-#         ifdef DEBUG_GIST
-          IDX[3] = oidx2;
-#         endif
         }
       }
-    } // END loop over all solvent molecules
+    }
     // Compute the tetrahedral order parameter
     double sum = 0.0;
     for (int mol1 = 0; mol1 < 3; mol1++) {
       for (int mol2 = mol1 + 1; mol2 < 4; mol2++) {
         Vec3 v1 = WAT[mol1] - XYZ1;
         Vec3 v2 = WAT[mol2] - XYZ1;
-#       ifdef DEBUG_GIST
-        if (debugOut_ != 0) debugOut_->Printf("\t\t{%8.3f %8.3f %8.3f} * {%8.3f %8.3f %8.3f}\n", v1[0], v1[1], v1[2], v2[0], v2[1], v2[2]);
-#       endif
         double r1 = v1.Magnitude2();
         double r2 = v2.Magnitude2();
         double cos = (v1* v2) / sqrt(r1 * r2);
@@ -1451,42 +1430,234 @@ void Action_GIST::Order(Frame const& frameIn) {
       }
     }
     order_->UpdateVoxel(voxel1, (1.0 - (3.0/8)*sum));
-#   ifdef DEBUG_GIST
-    if (debugOut_ != 0) {
-      //debugOut_->Printf("Order: gidx= %8u  oidx1=%8i  voxel1= %8i  XYZ1={%12.4f %12.4f %12.4f}  sum= %g\n", gidx, oidx1, voxel1, XYZ1[0], XYZ1[1], XYZ1[2], sum);
-      debugOut_->Printf("Order: oidx1=%8i  voxel1= %8i  sum= %g\n", oidx1, voxel1, sum);
-      //debugOut_->Printf("Order indices: %8i %8i %8i %8i\n", IDX[0], IDX[1], IDX[2], IDX[3]);
-      debugOut_->Printf("Order dist2  : %8.3f %8.3f %8.3f %8.3f\n", d1, d2, d3, d4);
+    //mprintf("DBG: gidx= %u  oidx1=%i  voxel1= %i  XYZ1={%g, %g, %g}  sum= %g\n", gidx, oidx1, voxel1, XYZ1[0], XYZ1[1], XYZ1[2], sum);
+  } // END loop over all solvent molecules
+}
+
+///define Hbonds function
+bool Action_GIST::EvalAngle( Site const& SiteD, const double* XYZD, int a_atom, const double* XYZA, Frame const& frmIn) // the Site D is the donor site
+{
+
+  // The two sites are close enough to hydrogen bond.
+  //mprintf("Entering EvalAngle funtion \n");
+  int d_atom = SiteD.Idx();
+  // Determine if angle cutoff is satisfied
+
+  //mprintf("site atom idx is [%i], with [%i] H atoms  \n", d_atom, SiteD.n_hydrogens());
+  
+  
+  for (Iarray::const_iterator h_atom = SiteD.Hbegin(); h_atom != SiteD.Hend(); ++h_atom) // loop over the hydrogen atoms in donor site
+  {
+    double angle = 0.0;
+    bool angleSatisfied = true;
+    //mprintf("iterate the hydorgen atoms bonded to [%i] heavey atom", SiteD.Idx());
+
+ 
+    // For ions, donor atom will be same as h atom so no angle needed.
+    if (d_atom != *h_atom) {
+      
+      angle = Angle(XYZA, frmIn.XYZ(*h_atom), XYZD, frmIn.BoxCrd());
+      //mprintf("site atom idx is [%i], with [%i] H atoms  \n", d_atom, SiteD.n_hydrogens());
+      //mprintf("the angle is [%g] \n", angle);
+      //mprintf("the hydrogen atom in the donor site is [%i]\n", *h_atom);
+      angleSatisfied = !(angle < acut_);
+      if (angleSatisfied)
+      {
+        //mprintf("EvalAngle funtion return true \n");
+      
+        return true;
+      }
+      else if (h_atom == SiteD.Hend()-1)
+      {
+        //mprintf("EvalAngle function return false \n");
+        return false;
+      }
     }
-#   endif
-  } // END loop over all solvent molecules on the grid
+
+    
+  }
+  
+}
+
+//Define angle function to calcuate the angle or XA-H-XD for hbond analysis
+
+double Action_GIST::Angle(const double* XA, const double* XH, const double* XD, Box const& boxIn) const
+{
+  if (imageOpt_.ImagingType() == ImageOption::NO_IMAGE)
+    return (CalcAngle(XA, XH, XD));
+  else {
+    double angle;
+    Vec3 VH = Vec3(XH);
+    Vec3 H_A = MinImagedVec(VH, Vec3(XA), boxIn.UnitCell(), boxIn.FracCell());
+    Vec3 H_D = Vec3(XD) - VH;
+    double rha = H_A.Magnitude2();
+    double rhd = H_D.Magnitude2();
+    if (rha > Constants::SMALL && rhd > Constants::SMALL) {
+      angle = (H_A * H_D) / sqrt(rha * rhd);
+      if      (angle >  1.0) angle =  1.0;
+      else if (angle < -1.0) angle = -1.0;
+      angle = acos(angle);
+    } else
+      angle = 0.0;
+    return angle;
+  }
+}
+
+//Perform the hbond analysis and update the voxel-wise hbond data
+void Action_GIST::Hbond(Frame const& frameIn)
+{
+  mprintf("enter hbond function \n");
+
+  double* Nsw_don = &(Nsw_don_[0]);
+  double* Nsw_acc = &(Nsw_acc_[0]);
+  double* Nww_don = &(Nww_don_[0]);
+  double* Nww_acc = &(Nww_acc_[0]);
+  // Set up imaging info.
+
+  mprintf("size checks Esw_: %d, %d, %d\n", sizeof(Esw_), sizeof(Esw_[0]), sizeof(Esw_)/sizeof(Esw_[0]));
+  mprintf("size checks Nsw_don_: %d, %d, %d\n", sizeof(Nsw_don_), sizeof(Nsw_don_[0]), sizeof(Nsw_don_)/sizeof(Nsw_don_[0]));
+  mprintf("size checks Nsw_don: %d, %d, %d\n", sizeof(Nsw_don), sizeof(Nsw_don[0]), sizeof(Nsw_don)/sizeof(Nsw_don[0]));
+
+ // Loop over all water site in grid and assign the hbond data to each voxel accordingly
+
+  int vidx;
+  int vidxend = (int)SolventSites_.size();
+  
+
+
+  for (vidx = 0; vidx < vidxend; vidx++)
+    {
+      // the voxel index of this water site
+      Site const& Vsite = SolventSites_[vidx];
+      int v_voxel = atom_voxel_[Vsite.Idx()];
+       
+      //perform the hbond analysis only when the oxygen of the solvent site is in GIST grid 
+      if (v_voxel >=0)
+      {
+
+        const double* VXYZ = frameIn.XYZ( Vsite.Idx() );
+
+        mprintf("calculate hbond on solvent site [%i] \n", Vsite.Idx());
+      
+        
+        // Loop over solute sites that can be both donor and acceptor
+        for (unsigned int sidx = 0; sidx < bothEnd_; sidx++)
+        {
+          
+        
+          const double* UXYZ = frameIn.XYZ( Both_[sidx].Idx() );
+          double dist2 = DIST2( imageOpt_.ImagingType(), VXYZ, UXYZ, frameIn.BoxCrd() );
+          if ( !(dist2 > dcut2_) )
+          {
+            mprintf("loop over solute A&D \n");
+            // Solvent site donor, solute site acceptor
+            if(EvalAngle(Vsite, VXYZ, Both_[sidx].Idx(), UXYZ, frameIn))
+            {
+              //mprintf("Nsw_don plus 1 \n");
+              Nsw_don[v_voxel] +=1; 
+
+            }
+            // Solvent site acceptor, solute site donor
+            if(EvalAngle(Both_[sidx], UXYZ, Vsite.Idx(), VXYZ, frameIn))
+            {
+              //mprintf("Nsw_acc plus 1 \n");
+              Nsw_acc[v_voxel] +=1;
+            }
+          }
+        }
+        //Loop over solute sites that are donor only
+        
+        mprintf("looping over solute donor only \n");
+        for (unsigned int sidx = bothEnd_; sidx < Both_.size(); sidx++)
+        {
+          
+          const double* UXYZ = frameIn.XYZ( Both_[sidx].Idx() );
+          double dist2 = DIST2( imageOpt_.ImagingType(), VXYZ, UXYZ, frameIn.BoxCrd() );
+          if ( !(dist2 > dcut2_) and (EvalAngle(Both_[sidx], UXYZ, Vsite.Idx(), VXYZ, frameIn)))
+          // Solvent site acceptor, solute site donor
+          { 
+            mprintf("Nsw_acc plus 1 \n");
+            Nsw_acc[v_voxel] +=1;
+          }
+        }
+        // Loop over solute sites that are acceptor only
+        mprintf("looping over solute acceptor only \n");
+        for (Iarray::const_iterator a_atom = Acceptor_.begin(); a_atom != Acceptor_.end(); ++a_atom)
+        {
+          const double* UXYZ = frameIn.XYZ( *a_atom );
+          double dist2 = DIST2( imageOpt_.ImagingType(), VXYZ, UXYZ, frameIn.BoxCrd() );
+          if ( !(dist2 > dcut2_) and EvalAngle(Vsite, VXYZ, *a_atom, UXYZ, frameIn))
+          // Solvent site donor, solute site acceptor
+          {
+            mprintf("Nsw_don plus 1 \n");
+            Nsw_don[v_voxel] +=1;
+          }
+        } // END loop over solute sites
+        
+
+        // Loop over other solvent site
+        mprintf("looping over other solvent sites \n");
+        
+        
+        for (int V1_idx = vidx + 1; V1_idx < vidxend; V1_idx++)
+        {
+          
+          Site const& V1_Site = SolventSites_[V1_idx];
+          const double* V1_XYZ = frameIn.XYZ( V1_Site.Idx() );
+          int V1_voxel = atom_voxel_[V1_Site.Idx()]; // the voxel index of V1
+          mprintf("second water site V1_Site [%i] \n", V1_Site.Idx());
+
+          double dist2 = DIST2( imageOpt_.ImagingType(), VXYZ, V1_XYZ, frameIn.BoxCrd() );
+
+          if ( !(dist2 > dcut2_) )
+          {
+          
+            // VSite is donor, V1_Site is acceptor
+            
+            
+            if (EvalAngle(Vsite,VXYZ,V1_Site.Idx(),V1_XYZ,frameIn))  ///<--- this is the segment error
+            {
+              
+              
+              Nww_don[v_voxel] +=1;
+              if (V1_voxel >=0)
+              {
+                Nww_acc[V1_voxel] +=1;
+              }
+              
+            }
+            
+           
+            if (EvalAngle(V1_Site,V1_XYZ,Vsite.Idx(),VXYZ,frameIn))
+            {
+              
+              if (V1_voxel >=0)
+              {
+                Nww_don[V1_voxel] +=1;
+              }
+              Nww_acc[v_voxel] +=1;
+              
+            }
+            
+          } 
+          
+                
+        }
+        mprintf("for this solvent, finished the looping for other solvent site \n");
+      }
+    } 
 }
 
 /** GIST action */
 Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
   gist_action_.Start();
+  mprintf("in action, line 1652\n");
   NFRAME_++;
   // TODO only !skipE?
   N_ON_GRID_ = 0;
   OnGrid_idxs_.clear();
   OnGrid_XYZ_.clear();
   atom_voxel_.assign( frm.Frm().Natom(), OFF_GRID_ );
-
-  // Move the grid if needed
-  if (mover_.NeedsMove()) {
-    mover_.MoveGrid(frm.Frm(), moveMask_, static_cast<DataSet_3D&>( *masterGrid_ ));
-    // Set border grid center to regular grid center
-    borderGrid_.SetOriginFromCenter( masterGrid_->Bin().GridCenter() );
-    //if (mover_.RotationHappened()) {
-#     ifdef DEBUG_GIST
-      mover_.RotMatrix().Print("RotMatrix");
-#     endif
-      // Remove any previous rotation from the border grid
-      borderGrid_.Assign_UnitCell( borderGridUcell0_ );
-      // Rotate the border grid the same way as the regular grid
-      borderGrid_.RotateGrid( mover_.RotMatrix() );
-    //}
-  }
 
   if (!skipE_) {
     for (int thread = 0; thread != numthreads_; thread++) {
@@ -1516,13 +1687,11 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
     case ImageOption::ORTHO    : mprintf("DEBUG: Orthogonal image.\n"); break;
     case ImageOption::NONORTHO : mprintf("DEBUG: Nonorthogonal image.\n"); break;
   }
-
-  if (debugOut_ != 0) {
-    debugOut_->Printf("Frame %i grid oxyz= %12.4f %12.4f %12.4f\n", frameNum+1, gridBin_->GridOrigin()[0], gridBin_->GridOrigin()[1], gridBin_->GridOrigin()[2]);
-    debugOut_->Printf("Frame %i grid mxyz= %12.4f %12.4f %12.4f\n", frameNum+1, gridBin_->MX(), gridBin_->MY(), gridBin_->MZ());
-    debugOut_->Printf("Frame %i border oxyz %12.4f %12.4f %12.4f\n", frameNum+1, borderGrid_.GridOrigin()[0], borderGrid_.GridOrigin()[1], borderGrid_.GridOrigin()[2]);
-  }
 # endif
+  // CUDA necessary information
+
+  Vec3 const& Origin = gridBin_->GridOrigin();
+  mprintf("in action, line 1692\n");
   // Loop over each solvent molecule
   for (Topology::mol_iterator mol = CurrentParm_->MolStart(); mol != CurrentParm_->MolEnd(); ++mol)
   {
@@ -1532,17 +1701,13 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
     if (atomIsSolute_[mol_first]) { continue; }
     Vec3 mol_center = calcMolCenter(frm, mol_first, mol_end);
     // frm.Frm().VCenterOfMass(oidx, oidx+nMolAtoms_);
-    bool isNearGrid = borderGrid_.IsOnGrid(mol_center[0], mol_center[1], mol_center[2]);
+    Vec3 W_G = mol_center - Origin;
     gist_grid_.Stop();
-#   ifdef DEBUG_GIST
-    if (debugOut_ != 0) {
-      //debugOut_->Printf("\tMol %6li ctr= %8.3f %8.3f %8.3f  W_G= %8.3f %8.3f %8.3f\n", mol - CurrentParm_->MolStart() + 1, mol_center[0], mol_center[1], mol_center[2], W_G[0], W_G[1], W_G[2]);
-      debugOut_->Printf("\tMol %6li\n", mol - CurrentParm_->MolStart() + 1);
-      debugOut_->Printf("\t\tIsNearGrid= %i\n", (int)isNearGrid);
-    }
-#   endif
     // Check if water oxygen is no more then 1.5 Ang from grid
-    if (isNearGrid)
+    // NOTE: using <= to be consistent with original code
+    if ( W_G[0] <= G_max_[0] && W_G[0] >= -1.5 &&
+         W_G[1] <= G_max_[1] && W_G[1] >= -1.5 &&
+         W_G[2] <= G_max_[2] && W_G[2] >= -1.5 )
     {
       // Try to bin the oxygen
       int voxel = calcVoxelIndex(mol_center[0], mol_center[1], mol_center[2]);
@@ -1552,9 +1717,6 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
         const double* wXYZ = frm.Frm().XYZ( mol_first );
         for (int atom = mol_first; atom != mol_end; ++atom) {
           atom_voxel_[atom] = voxel;
-#         ifdef DEBUG_GIST
-          if (debugOut_ != 0) debugOut_->Printf("\t\tAtom %8i voxel %12i\n", atom+1, voxel);
-#         endif
           OnGrid_idxs_.push_back( atom );
           OnGrid_XYZ_.push_back( wXYZ[0] );
           OnGrid_XYZ_.push_back( wXYZ[1] );
@@ -1564,7 +1726,7 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
         }
         ++N_solvent_[voxel];
         max_nwat_ = std::max( N_solvent_[voxel], max_nwat_ );
-
+        mprintf("in action, line 1727\n");
         if (solventType_[mol_first] != UNKNOWN_MOLECULE_) {
             molDensitySets_[solventType_[mol_first]]->UpdateVoxel(voxel, 1.0);
         }
@@ -1575,45 +1737,18 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
           ++N_main_solvent_[voxel];
           // Record XYZ coords of water atoms (nonEP) in voxel TODO need EP?
           if (!skipS_) {
-            Vec3 H1_wat, H2_wat;
-            if (mover_.NeedsMove()) {
-              // Need to rotate into reference frame of the rotated grid.
-              // Pivot point is the center of the grid.
-              Vec3 ongrid = mover_.RotMatrix().TransposeMult( mol_center - gridBin_->GridCenter() );
-              voxel_xyz_[voxel].push_back( ongrid[0] );
-              voxel_xyz_[voxel].push_back( ongrid[1] );
-              voxel_xyz_[voxel].push_back( ongrid[2] );
-#             ifdef DEBUG_GIST
-              if (debugOut_ != 0) debugOut_->Printf("\t\tVXYZ %12.4f %12.4f %12.4f\n", ongrid[0], ongrid[1], ongrid[2]);
-#             endif
-              // Get O-HX vectors
-              Vec3 O_XYZ  = mover_.RotMatrix().TransposeMult( Vec3(frm.Frm().XYZ(mol_first + rigidAtomIndices_[0])) - gridBin_->GridCenter() );
-              Vec3 H1_XYZ = mover_.RotMatrix().TransposeMult( Vec3(frm.Frm().XYZ(mol_first + rigidAtomIndices_[1])) - gridBin_->GridCenter() );
-              Vec3 H2_XYZ = mover_.RotMatrix().TransposeMult( Vec3(frm.Frm().XYZ(mol_first + rigidAtomIndices_[2])) - gridBin_->GridCenter() );
-              H1_wat = H1_XYZ - O_XYZ;
-              H2_wat = H2_XYZ - O_XYZ;
-            } else {
-              voxel_xyz_[voxel].push_back( mol_center[0] );
-              voxel_xyz_[voxel].push_back( mol_center[1] );
-              voxel_xyz_[voxel].push_back( mol_center[2] );
-#             ifdef DEBUG_GIST
-              if (debugOut_ != 0) debugOut_->Printf("\t\tVXYZ %12.4f %12.4f %12.4f\n", mol_center[0], mol_center[1], mol_center[2]);
-#             endif
-              // Get O-HX vectors
-              const double* O_XYZ  = frm.Frm().XYZ( mol_first + rigidAtomIndices_[0] );
-              const double* H1_XYZ = frm.Frm().XYZ( mol_first + rigidAtomIndices_[1] );
-              const double* H2_XYZ = frm.Frm().XYZ( mol_first + rigidAtomIndices_[2] );
-              H1_wat = Vec3( H1_XYZ[0]-O_XYZ[0], H1_XYZ[1]-O_XYZ[1], H1_XYZ[2]-O_XYZ[2] );
-              H2_wat = Vec3( H2_XYZ[0]-O_XYZ[0], H2_XYZ[1]-O_XYZ[1], H2_XYZ[2]-O_XYZ[2] );
-            }
+            voxel_xyz_[voxel].push_back( mol_center[0] );
+            voxel_xyz_[voxel].push_back( mol_center[1] );
+            voxel_xyz_[voxel].push_back( mol_center[2] );
+            // Get O-HX vectors
+            const double* O_XYZ  = frm.Frm().XYZ( mol_first + rigidAtomIndices_[0] );
+            const double* H1_XYZ = frm.Frm().XYZ( mol_first + rigidAtomIndices_[1] );
+            const double* H2_XYZ = frm.Frm().XYZ( mol_first + rigidAtomIndices_[2] );
+            Vec3 H1_wat( H1_XYZ[0]-O_XYZ[0], H1_XYZ[1]-O_XYZ[1], H1_XYZ[2]-O_XYZ[2] );
+            Vec3 H2_wat( H2_XYZ[0]-O_XYZ[0], H2_XYZ[1]-O_XYZ[1], H2_XYZ[2]-O_XYZ[2] );
             H1_wat.Normalize();
             H2_wat.Normalize();
-#           ifdef DEBUG_GIST
-            if (debugOut_ != 0) {
-              debugOut_->Printf("\t\tH1_wat %12.4f %12.4f %12.4f\n", H1_wat[0], H1_wat[1], H1_wat[2]);
-              debugOut_->Printf("\t\tH2_wat %12.4f %12.4f %12.4f\n", H2_wat[0], H2_wat[1], H2_wat[2]);
-            }
-#           endif
+
             if (fabs(H1_wat * H2_wat) > 0.99) {  // < 8.11 or > 171.11 degrees
               ++n_linear_solvents_;
             }
@@ -1672,7 +1807,7 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
             H_temp2[2] = 2*(x2*z2+w2*y2)*H2_wat[0];
             H_temp2[2] = (2*(y2*z2-w2*x2)*H2_wat[1]) +H_temp2[2];
             H_temp2[2] = ((w2*w2-x2*x2-y2*y2+z2*z2)*H2_wat[2]) + H_temp2[2];
-
+            mprintf("in action, line 1808\n");
             H2_wat = H_temp2;
 
             Vec3 ar2 = H_temp.Cross(H_temp2);
@@ -1718,30 +1853,15 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
           double DPX = 0.0;
           double DPY = 0.0;
           double DPZ = 0.0;
-          if (mover_.NeedsMove()) {
-            // Need to rotate into reference frame of the rotated grid.
-            // Pivot point is the center of the grid.
-            // TODO consolidate this rotation with the one for entropy above?
-            for (int IDX = 0; IDX != mol_end-mol_first; IDX++) {
-              Vec3 ongrid = mover_.RotMatrix().TransposeMult( Vec3(frm.Frm().XYZ(mol_first+IDX)) - gridBin_->GridCenter() );
-              DPX += ongrid[0] * Q_.at(IDX);
-              DPY += ongrid[1] * Q_.at(IDX);
-              DPZ += ongrid[2] * Q_.at(IDX);
-            }
-          } else {
-            for (int IDX = 0; IDX != mol_end-mol_first; IDX++) {
-              const double* XYZ = frm.Frm().XYZ( mol_first+IDX );
-              DPX += XYZ[0] * Q_.at(IDX);
-              DPY += XYZ[1] * Q_.at(IDX);
-              DPZ += XYZ[2] * Q_.at(IDX);
-            }
+          for (int IDX = 0; IDX != mol_end-mol_first; IDX++) {
+            const double* XYZ = frm.Frm().XYZ( mol_first+IDX );
+            DPX += XYZ[0] * Q_.at(IDX);
+            DPY += XYZ[1] * Q_.at(IDX);
+            DPZ += XYZ[2] * Q_.at(IDX);
           }
           dipolex_->UpdateVoxel(voxel, DPX);
           dipoley_->UpdateVoxel(voxel, DPY);
           dipolez_->UpdateVoxel(voxel, DPZ);
-#         ifdef DEBUG_GIST
-          if (debugOut_ != 0) debugOut_->Printf("\t\tDipole voxel %12i %12.4f %12.4f %12.4f\n", voxel, DPX, DPY, DPZ);
-#         endif
           gist_dipole_.Stop();
         }
         // ---------------------------------------
@@ -1761,7 +1881,7 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
       }
     } // END water is within 1.5 Ang of grid
   } // END loop over each solvent molecule
-
+  mprintf("in action, line 1882\n");
   // Do solute grid assignment for PME
   if (usePme_) {
     U_onGrid_idxs_.clear();
@@ -1770,10 +1890,15 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
     {
       int uidx = U_idxs_[s]; // the solute atom index
       const double* u_XYZ = frm.Frm().XYZ( uidx );
+      // get the vector of this solute atom to the grid origin
+      Vec3 U_G( u_XYZ[0] - Origin[0],
+                u_XYZ[1] - Origin[1],
+                u_XYZ[2] - Origin[2]);
+      //size_t bin_i, bin_j, bin_k;
 
-      bool isNearGrid = borderGrid_.IsOnGrid(u_XYZ[0], u_XYZ[1], u_XYZ[2]);
-
-      if (isNearGrid)
+      if ( U_G[0] <= G_max_[0] && U_G[0] >= -1.5 &&
+           U_G[1] <= G_max_[1] && U_G[1] >= -1.5 &&
+           U_G[2] <= G_max_[2] && U_G[2] >= -1.5)
       {
         int voxel = calcVoxelIndex(u_XYZ[0], u_XYZ[1], u_XYZ[2]);
         if ( voxel != OFF_GRID_ )
@@ -1787,7 +1912,7 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
     }
     gist_grid_.Stop();
   }
-
+  mprintf("in action, line 1913\n");
 # ifndef CUDA
   // Do order calculation if requested.
   // Do not do this for CUDA since CUDA nonbond routine handles the order calc.
@@ -1795,14 +1920,16 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
   //       the nonbond calc can modify the on-grid coordinates (for minimum
   //       image convention when cell is non-orthogonal).
   gist_order_.Start();
-  if (doOrder_) {
-    if (PL_active_)
-      Order_PL(frm.Frm());
-    else
-      Order(frm.Frm());
-  }
+  if (doOrder_) Order(frm.Frm());
   gist_order_.Stop();
 # endif
+  // Do Hbond analysis
+  mprintf("doing Hbond anaylsis: \n");
+  gist_hbond_.Start();
+
+  if (hbond_) Hbond( frm.Frm());
+  gist_hbond_.Stop();
+  mprintf("hbond done!!\n");
   // Do nonbond energy calc if not skipping energy
   gist_nonbond_.Start();
   if (!skipE_) {
@@ -1959,303 +2086,6 @@ double Action_GIST::SumDataSet(const DataSet_3D& ds) const
   return total;
 }
 
-#ifdef MPI
-/** Sum the given integer array to the master. */
-static inline void reduce_iarray_master(Parallel::Comm const& commIn, std::vector<int>& itmp, std::vector<int>& iarray)
-{
-  commIn.ReduceMaster( &itmp[0], &iarray[0], iarray.size(), MPI_INT, MPI_SUM );
-  iarray = itmp;
-}
-
-/** Sum the given double array to the master. */
-static inline void reduce_darray_master(Parallel::Comm const& commIn, std::vector<double>& dtmp, std::vector<double>& darray)
-{
-  commIn.ReduceMaster( &dtmp[0], &darray[0], darray.size(), MPI_DOUBLE, MPI_SUM );
-  darray = dtmp;
-}
-
-/** Sync the given Xarray to the master. */
-void Action_GIST::sync_Xarray(Xarray& xarrayIn) const {
-  if (trajComm_.Master()) {
-    Farray frecv;
-    int fsendsize;
-    for (int rank = 1; rank < trajComm_.Size(); rank++) {
-      // Get size of fsend from non-master
-      trajComm_.Recv( &fsendsize, 1, MPI_INT, rank, 2100 );
-      frecv.resize( fsendsize );
-      // Get fsend from non-master
-      trajComm_.Recv( &frecv[0], frecv.size(), MPI_FLOAT, rank, 2101 );
-      // Place values in frecv in xarrayIn
-      unsigned int idx = 0;
-      while (idx < frecv.size()) {
-        unsigned int grpt = (unsigned int)frecv[idx++];
-        unsigned int nvals = (unsigned int)frecv[idx++];
-        for (unsigned int jdx = 0; jdx < nvals; jdx++)
-          xarrayIn[grpt].push_back( frecv[idx++] );
-      }
-    } // END loop over ranks
-  } else {
-    // non-master
-    // Compact the xarrayIn array.
-    // Store [grid point 0] [# values] [value0] ... [valueN] [grid point 1] ...
-    Farray fsend;
-    for (unsigned int ig = 0; ig != MAX_GRID_PT_; ig++) {
-      Farray const& fgrid = xarrayIn[ig];
-      if (!fgrid.empty()) {
-        fsend.push_back( ig );
-        // How many values in this grid point
-        fsend.push_back( fgrid.size() );
-        // store values
-        for (Farray::const_iterator it = fgrid.begin(); it != fgrid.end(); it++)
-          fsend.push_back( *it );
-      }
-    }
-    // Send size of fsend to master
-    int fsendsize = (int)fsend.size();
-    trajComm_.Send( &fsendsize, 1, MPI_INT, 0, 2100 );
-    // Send fsend
-    trajComm_.Send( &fsend[0], fsend.size(), MPI_FLOAT, 0, 2101 );
-  }
-}
-
-/** Sync all information to the master process. */
-int Action_GIST::SyncAction() {
-  // Calc total number of frames.
-  int total_frames = 0;
-  trajComm_.ReduceMaster( &total_frames, &NFRAME_, 1, MPI_INT, MPI_SUM );
-  if (trajComm_.Master())
-    NFRAME_ = total_frames;
-  if (debug_ > 0) mprintf("DEBUG: GIST total frame count: %i\n", NFRAME_);
-  // Update # counts
-  Iarray itmp( MAX_GRID_PT_ );
-  reduce_iarray_master(trajComm_, itmp, N_solvent_);
-  reduce_iarray_master(trajComm_, itmp, N_main_solvent_);
-  reduce_iarray_master(trajComm_, itmp, N_solute_atoms_);
-  reduce_iarray_master(trajComm_, itmp, N_hydrogens_);
-  // Update double arrays
-  Darray dtmp( MAX_GRID_PT_ );
-  if (usePme_ && !skipE_) {
-    reduce_darray_master(trajComm_, dtmp, E_pme_);
-    reduce_darray_master(trajComm_, dtmp, U_E_pme_);
-  }
-  // Max # waters
-  if (trajComm_.Master()) {
-    for (Iarray::const_iterator it = N_solvent_.begin(); it != N_solvent_.end(); ++it)
-      max_nwat_ = std::max(max_nwat_, *it);
-  }
-  // Update Xarray counts. Compact the arrays on each thread to take less space.
-  sync_Xarray( voxel_xyz_ );
-  sync_Xarray( voxel_Q_ );
-
-  return 0;
-}
-
-/** Do the translational entropy calc in parallel */
-int Action_GIST::ParallelPostCalc() {
-  gist_print_TE_.Start();
-  mprintf("    GIST: Performing translational entropy calc in parallel.\n");
-  gist_entropy_comm_.Start();
-  // Broadcast any necessary info to other processors
-  trajComm_.MasterBcast( &N_main_solvent_[0], N_main_solvent_.size(), MPI_INT );
-  trajComm_.MasterBcast( &NFRAME_, 1, MPI_INT );
-  // Divide grid points among processes
-  int my_start, my_stop;
-  int my_grid_points = trajComm_.DivideAmongProcesses(my_start, my_stop, MAX_GRID_PT_);
-  if (debug_ > 0) rprintf("DEBUG: My grid points = %i to %i (%i)\n", my_start, my_stop, my_grid_points);
-  std::vector<int> process_start( trajComm_.Size() );
-  trajComm_.GatherMaster(&my_start, 1, MPI_INT, &process_start[0]);
-  std::vector<int> process_stop( trajComm_.Size() );
-  trajComm_.GatherMaster(&my_stop, 1, MPI_INT, &process_stop[0]);
-  // Ensure voxel_xyz_ and voxel_Q_ are up-to-date on each process
-  for (unsigned int gr_pt = 0; gr_pt < MAX_GRID_PT_; gr_pt++)
-  {
-    if (N_main_solvent_[gr_pt] > 0) {
-      //rprintf("DEBUG: Bcast for grid point %u\n", gr_pt);
-      Farray& vxyz = voxel_xyz_[gr_pt];
-      Farray& vq = voxel_Q_[gr_pt];
-      if (!trajComm_.Master()) {
-        vxyz.resize( N_main_solvent_[gr_pt]*3 );
-        vq.resize( N_main_solvent_[gr_pt]*4 );
-      }
-      trajComm_.MasterBcast( &vxyz[0], N_main_solvent_[gr_pt]*3, MPI_FLOAT );
-      trajComm_.MasterBcast( &vq[0],   N_main_solvent_[gr_pt]*4, MPI_FLOAT );
-    }
-  }
-/*  if (trajComm_.Master()) {
-    for (int rank = 1; rank < trajComm_.Size(); rank++) {
-      // Send to rank
-      rprintf("DEBUG: Master sending voxel arrays from %i to %i for rank %i\n", process_start[rank], process_stop[rank], rank);
-      for (int gr_pt = process_start[rank]; gr_pt < process_stop[rank]; gr_pt++)
-      {
-        if (gr_pt == process_start[rank]) rprintf("DEBUG: Point %i (%i)\n", gr_pt,N_main_solvent_[gr_pt] );
-        Farray const& vxyz = voxel_xyz_[gr_pt];
-        trajComm_.Send( &vxyz[0], N_main_solvent_[gr_pt]*3, MPI_FLOAT, rank, 10101+gr_pt ); // TODO tag
-        Farray const& vq = voxel_Q_[gr_pt];
-        trajComm_.Send( &vq[0],   N_main_solvent_[gr_pt]*4, MPI_FLOAT, rank, 10102+gr_pt ); // TODO tag
-      }
-    }
-  } else {
-    // Receive from master
-    rprintf("DEBUG: Rank %i receive voxel arrays from master (%i to %i)\n", trajComm_.Rank(), my_start, my_stop);
-    for (int gr_pt = my_start; gr_pt < my_stop; gr_pt++) {
-      rprintf("DEBUG: Point %i (%i)\n", gr_pt,N_main_solvent_[gr_pt] );
-      Farray& vxyz = voxel_xyz_[gr_pt];
-      vxyz.resize( N_main_solvent_[gr_pt]*3 );
-      trajComm_.Recv( &vxyz[0], N_main_solvent_[gr_pt]*3, MPI_FLOAT, 0, 10101+gr_pt ); // TODO tag
-      Farray& vq = voxel_Q_[gr_pt];
-      vq.resize( N_main_solvent_[gr_pt]*4 );
-      trajComm_.Recv( &vq[0],   N_main_solvent_[gr_pt]*4, MPI_FLOAT, 0, 10102+gr_pt ); // TODO tag
-    }
-  }*/
-  gist_entropy_comm_.Stop();
-  // Zero the grids
-  for (unsigned int gr_pt = 0; gr_pt < MAX_GRID_PT_; gr_pt++) {
-    dTStrans_->SetGrid(gr_pt, 0);
-    dTSsix_->SetGrid(gr_pt, 0);
-  }
-  // Do the translational entropy calculation
-  int nwts = CalcTranslationalEntropy(my_start, my_stop);
-  //rprintf("DEBUG: nwts= %i\n", nwts);
-  // Combine nwts
-  trajComm_.ReduceMaster( &watCountSubvol_, &nwts, 1, MPI_INT, MPI_SUM );
-  // Sync grids back to master.
-  // NOTE: The DataSet_3D Sync routines do not use 'total' or 'rank_frames'
-  //       arguments currently; just sums up grid to master with
-  //       ReduceMaster.
-  size_t fake_total = 0;
-  std::vector<int> fake_rank_frames(trajComm_.Size(), 0);
-  dTStrans_->Sync(fake_total, fake_rank_frames, trajComm_);
-  dTSsix_->Sync(fake_total, fake_rank_frames, trajComm_);
-//  if (trajComm_.Rank() == 0) {
-//    watCountSubvol_ = CalcTranslationalEntropy(0, MAX_GRID_PT_);
-//  }
-//  trajComm_.MasterBcast( &watCountSubvol_, 1, MPI_INT );
-  gist_print_TE_.Stop();
-  return 0;
-}
-#endif
-
-/** Calculate translational entropy.
-  * \param gridPointStart Starting grid point.
-  * \param gridPointEnd Ending grid point.
-  * \return ntws: water count in subvolume.
-  */
-int Action_GIST::CalcTranslationalEntropy(unsigned int gridPointStart, unsigned int gridPointEnd) const {
-  int nwts = 0;
-  int nx = griddim_[0];
-  int ny = griddim_[1];
-  int nz = griddim_[2];
-  double Vvox = gridBin_->VoxelVolume();
-
-//  Vec3 grid_origin(gridBin_->Center(0, 0, 0));
-
-  // Loop over all grid points
-  if (! this->skipS_)
-    mprintf("\tCalculating translational entropy:\n");
-  else
-    mprintf("Calculating Densities:\n");
-  for (unsigned int i_ds = 0; i_ds < solventInfo_.unique_elements.size(); ++i_ds) {
-    ScaleDataSet(*atomDensitySets_[i_ds], 1.0 / (double(NFRAME_)*Vvox*BULK_DENS_*double(solventInfo_.element_count[i_ds])));
-  }
-  ParallelProgress te_progress( gridPointEnd - gridPointStart );
-  int n_finished = 0;
-# ifdef _OPENMP
-# pragma omp parallel shared(n_finished) firstprivate(te_progress)
-  {
-  te_progress.SetThread( omp_get_thread_num() );
-# pragma omp for
-# endif
-  for (unsigned int gr_pt = gridPointStart; gr_pt < gridPointEnd; gr_pt++) {
-    te_progress.Update( n_finished );
-    if (! this->skipS_) {
-      int nw_total = N_main_solvent_[gr_pt]; // Total number of waters that have been in this voxel.
-      int ix = gr_pt / (ny * nz);
-      int iy = (gr_pt / nz) % ny;
-      int iz = gr_pt % nz;
-      bool boundary = ( ix == 0 || iy == 0 || iz == 0 || ix == (nx-1) || iy == (ny-1) || iz == (nz-1) );
-
-      if ( !boundary ) {
-#       ifdef DEBUG_GIST_6D
-        if (debugOut_ != 0 && nw_total > 0) debugOut_->Printf("Strans grid %8u voxel ijk= %8i %8i %8i\n", gr_pt, ix, iy, iz);
-#       endif
-        double strans_norm = 0.0;
-        double ssix_norm = 0.0;
-        int vox_nwts = 0;
-        for (int n0 = 0; n0 < nw_total; ++n0)
-        {
-#         ifdef DEBUG_GIST_6D
-          if (debugOut_ != 0) debugOut_->Printf("\twat %8i\n", n0);
-#         endif
-          Vec3 center(voxel_xyz_[gr_pt][3*n0], voxel_xyz_[gr_pt][3*n0+1], voxel_xyz_[gr_pt][3*n0+2]);
-          int q0 = n0 * 4;  // index into voxel_Q_ for n0
-          float W4 = voxel_Q_[gr_pt][q0  ];
-          float X4 = voxel_Q_[gr_pt][q0+1];
-          float Y4 = voxel_Q_[gr_pt][q0+2];
-          float Z4 = voxel_Q_[gr_pt][q0+3];
-          std::pair<double, double> NN = GistEntropyUtils::searchGridNearestNeighbors6D(
-            center, ix, iy, iz, W4, X4, Y4, Z4,
-            voxel_xyz_, voxel_Q_,
-            nx, ny, nz,
-            //grid_origin,
-            gridspacing_,
-            nNnSearchLayers_, n0
-#           ifdef DEBUG_GIST_6D
-            , debugOut_
-#           endif
-            );
-#         ifdef DEBUG_GIST_6D
-          if (debugOut_ != 0) debugOut_->Printf("\twat %8i NNd= %12.4f NNs= %12.4f\n", n0, NN.first, NN.second);
-#         endif
-          // It sometimes happens that we get numerically 0 values. 
-          // Using a minimum distance changes the result only by a tiny amount 
-          // (since those cases are rare), and avoids -inf values in the output.
-          double NNd = std::max(sqrt(NN.first), GIST_TINY);
-          double NNs = std::max(sqrt(NN.second), GIST_TINY);
-
-          bool has_neighbor = NN.first < GistEntropyUtils::GIST_HUGE;
-          if (has_neighbor) {
-            ++vox_nwts;
-            strans_norm += log((NNd*NNd*NNd*NFRAME_*4*Constants::PI*BULK_DENS_)/3);
-            double sixDens = (NNs*NNs*NNs*NNs*NNs*NNs*NFRAME_*Constants::PI*BULK_DENS_) / 48;
-            if (exactNnVolume_) {
-              sixDens /= GistEntropyUtils::sixVolumeCorrFactor(NNs);
-            }
-            ssix_norm += log(sixDens);
-            //mprintf("DEBUG1: dbl=%f NNs=%f\n", dbl, NNs);
-          }
-        } // END loop over all waters for this voxel
-#       ifdef DEBUG_GIST_6D
-        if (debugOut_ != 0) debugOut_->Printf("strans_norm= %12.4f  ssix_norm= %12.4f\n", strans_norm, ssix_norm);
-#       endif
-#       ifdef _OPENMP
-#       pragma omp critical
-#       endif
-        {
-          nwts += vox_nwts;
-          ++n_finished;
-          if (strans_norm != 0) {
-            dTStrans_->SetGrid(gr_pt, Constants::GASK_KCAL * temperature_ * nw_total
-                                    * (strans_norm/nw_total + Constants::EULER_MASC));
-            dTSsix_->SetGrid(gr_pt, Constants::GASK_KCAL * temperature_ * nw_total
-                                  * (ssix_norm/nw_total + Constants::EULER_MASC));
-          }
-        }
-      } else { // boundary
-#       ifdef _OPENMP
-#       pragma omp atomic
-#       endif
-        ++n_finished;
-      }
-    }
-  } // END loop over all grid points (voxels)
-  #ifdef _OPENMP
-  }
-  #endif
-  te_progress.Finish();
-
-  return nwts;
-}
-
 /** Handle averaging for grids and output from GIST. */
 void Action_GIST::Print() {
   if (!setupSuccessful_) {
@@ -2263,20 +2093,15 @@ void Action_GIST::Print() {
     return;
   }
   gist_print_.Start();
-
   double Vvox = gridBin_->VoxelVolume();
 
   mprintf("    GIST OUTPUT:\n");
-
-  // Finish moving the grid if needed
-  mover_.MoverFinish( static_cast<DataSet_3D&>( *masterGrid_ ) );
 
   // The variables are kept outside, so that they are declared for later use.
   // Calculate orientational entropy
   int nwtt = 0;
   if (! this->skipS_) {
     // LOOP over all voxels
-    gist_print_OE_.Start();
     mprintf("\tCalculating orientational entropy:\n");
     ParallelProgress oe_progress( MAX_GRID_PT_ );
     int n_finished = 0;
@@ -2290,9 +2115,7 @@ void Action_GIST::Print() {
     for (unsigned int gr_pt = 0; gr_pt < MAX_GRID_PT_; gr_pt++) {
       oe_progress.Update( n_finished );
       int nw_total = N_main_solvent_[gr_pt]; // Total number of waters that have been in this voxel.
-#     ifdef DEBUG_GIST
-      if (debugOut_ != 0 && nw_total > 0) debugOut_->Printf("Sorient: grid %8u nw_total %i\n", gr_pt, nw_total);
-#     endif
+      //mprintf("DEBUG1: %u nw_total %i\n", gr_pt, nw_total);
       if (nw_total == 1)
         n_single_occ++;
       if (nw_total > 1) {
@@ -2359,28 +2182,111 @@ void Action_GIST::Print() {
     }
     infofile_->Printf("Total referenced orientational entropy of the grid:"
                       " dTSorient = %9.5f kcal/mol, Nf=%d\n", SumDataSet(*dTSorient_) / NFRAME_, NFRAME_);
-    
-    gist_print_OE_.Start();
   }
   // Compute translational entropy for each voxel
-  gist_print_TE_.Start();
-  if (watCountSubvol_ == -1) {
-    //mprintf("DEBUG: Doing serial translational entropy calc.\n");
-    // watCountSubvol_ was nwts
-    watCountSubvol_ = CalcTranslationalEntropy(0, MAX_GRID_PT_);
+  int nwts = 0;
+  int nx = griddim_[0];
+  int ny = griddim_[1];
+  int nz = griddim_[2];
+
+  Vec3 grid_origin(gridBin_->Center(0, 0, 0));
+
+  // Loop over all grid points
+  if (! this->skipS_)
+    mprintf("\tCalculating translational entropy:\n");
+  else
+    mprintf("Calculating Densities:\n");
+  for (unsigned int i_ds = 0; i_ds < solventInfo_.unique_elements.size(); ++i_ds) {
+    ScaleDataSet(*atomDensitySets_[i_ds], 1.0 / (double(NFRAME_)*Vvox*BULK_DENS_*double(solventInfo_.element_count[i_ds])));
   }
-  gist_print_TE_.Stop();
+  ParallelProgress te_progress( MAX_GRID_PT_ );
+  int n_finished = 0;
+# ifdef _OPENMP
+# pragma omp parallel shared(n_finished) firstprivate(te_progress)
+  {
+  te_progress.SetThread( omp_get_thread_num() );
+# pragma omp for
+# endif
+  for (unsigned int gr_pt = 0; gr_pt < MAX_GRID_PT_; gr_pt++) {
+    te_progress.Update( n_finished );
+    if (! this->skipS_) {
+      int nw_total = N_main_solvent_[gr_pt]; // Total number of waters that have been in this voxel.
+      int ix = gr_pt / (ny * nz);
+      int iy = (gr_pt / nz) % ny;
+      int iz = gr_pt % nz;
+      bool boundary = ( ix == 0 || iy == 0 || iz == 0 || ix == (nx-1) || iy == (ny-1) || iz == (nz-1) );
+
+      if ( !boundary ) {
+        double strans_norm = 0.0;
+        double ssix_norm = 0.0;
+        int vox_nwts = 0;
+        for (int n0 = 0; n0 < nw_total; ++n0)
+        {
+          Vec3 center(voxel_xyz_[gr_pt][3*n0], voxel_xyz_[gr_pt][3*n0+1], voxel_xyz_[gr_pt][3*n0+2]);
+          int q0 = n0 * 4;  // index into voxel_Q_ for n0
+          float W4 = voxel_Q_[gr_pt][q0  ];
+          float X4 = voxel_Q_[gr_pt][q0+1];
+          float Y4 = voxel_Q_[gr_pt][q0+2];
+          float Z4 = voxel_Q_[gr_pt][q0+3];
+          std::pair<double, double> NN = GistEntropyUtils::searchGridNearestNeighbors6D(
+            center, W4, X4, Y4, Z4,
+            voxel_xyz_, voxel_Q_,
+            nx, ny, nz, grid_origin, gridspacing_,
+            nNnSearchLayers_, n0);
+          // It sometimes happens that we get numerically 0 values. 
+          // Using a minimum distance changes the result only by a tiny amount 
+          // (since those cases are rare), and avoids -inf values in the output.
+          double NNd = std::max(sqrt(NN.first), GIST_TINY);
+          double NNs = std::max(sqrt(NN.second), GIST_TINY);
+
+          bool has_neighbor = NN.first < GistEntropyUtils::GIST_HUGE;
+          if (has_neighbor) {
+            ++vox_nwts;
+            strans_norm += log((NNd*NNd*NNd*NFRAME_*4*Constants::PI*BULK_DENS_)/3);
+            double sixDens = (NNs*NNs*NNs*NNs*NNs*NNs*NFRAME_*Constants::PI*BULK_DENS_) / 48;
+            if (exactNnVolume_) {
+              sixDens /= GistEntropyUtils::sixVolumeCorrFactor(NNs);
+            }
+            ssix_norm += log(sixDens);
+            //mprintf("DEBUG1: dbl=%f NNs=%f\n", dbl, NNs);
+          }
+        } // END loop over all waters for this voxel
+#       ifdef _OPENMP
+#       pragma omp critical
+#       endif
+        {
+          nwts += vox_nwts;
+          ++n_finished;
+          if (strans_norm != 0) {
+            dTStrans_->SetGrid(gr_pt, Constants::GASK_KCAL * temperature_ * nw_total
+                                    * (strans_norm/nw_total + Constants::EULER_MASC));
+            dTSsix_->SetGrid(gr_pt, Constants::GASK_KCAL * temperature_ * nw_total
+                                  * (ssix_norm/nw_total + Constants::EULER_MASC));
+          }
+        }
+      } else { // boundary
+#       ifdef _OPENMP
+#       pragma omp atomic
+#       endif
+        ++n_finished;
+      }
+    }
+  } // END loop over all grid points (voxels)
+  #ifdef _OPENMP
+  }
+  #endif
+  te_progress.Finish();
   if (!this->skipS_) {
     infofile_->Printf("watcount in vol = %d\n", nwtt);
-    infofile_->Printf("watcount in subvol = %d\n", watCountSubvol_);
+    infofile_->Printf("watcount in subvol = %d\n", nwts);
     infofile_->Printf("Total referenced translational entropy of the grid:"
                       " dTStrans = %9.5f kcal/mol, Nf=%d\n", SumDataSet(*dTStrans_) / NFRAME_, NFRAME_);
     double total_6d_1vox = 0;
     double total_t_1vox = 0;
     double total_o_1vox = 0;
-    if (watCountSubvol_ > 0) {
-      total_6d_1vox = SumDataSet(*dTSsix_) / (double)watCountSubvol_;
-      total_t_1vox = SumDataSet(*dTStrans_) / (double)watCountSubvol_;
+    if (nwts > 0) {
+      total_6d_1vox = SumDataSet(*dTSsix_) / (double)nwts;
+      total_t_1vox = SumDataSet(*dTStrans_) / (double)nwts;
     } else
       mprintf("Warning: Not enough data in voxels to calculate 6D and translational entropy.\n");
     if (nwtt > 0)
@@ -2465,6 +2371,12 @@ void Action_GIST::Print() {
   Farray dipolez_dens = WeightDataSet<float>(*dipolez_, 1.0 / (Constants::DEBYE_EA * NFRAME_ * Vvox));
   Darray order_norm = NormalizeDataSet<double>(*order_, N_main_solvent_);
 
+  //if (hbond_) {
+  Farray sw_Acc = WeightDataSet<float>(*sw_Acc_, 1.0 / (NFRAME_));
+  Farray sw_Don = WeightDataSet<float>(*sw_Don_, 1.0 / (NFRAME_));
+  Farray ww_Acc = WeightDataSet<float>(*ww_Acc_, 1.0 / (NFRAME_));
+  Farray ww_Don = WeightDataSet<float>(*ww_Don_, 1.0 / (NFRAME_));
+  //}
   // Write final values to the datasets
   CopyArrayToDataSet(Esw_dens, *Esw_);
   CopyArrayToDataSet(Eww_dens, *Eww_);
@@ -2481,6 +2393,12 @@ void Action_GIST::Print() {
   CopyArrayToDataSet(dipolez_dens, *dipolez_);
   CopyArrayToDataSet(order_norm, *order_);
   CopyArrayToDataSet(neighbor_norm, *neighbor_);
+  if (hbond_) {
+    CopyArrayToDataSet(sw_Acc, *sw_Acc_);
+    CopyArrayToDataSet(sw_Don, *sw_Don_);
+    CopyArrayToDataSet(ww_Acc, *ww_Acc_);
+    CopyArrayToDataSet(ww_Don, *ww_Don_);
+  }
 
   for (unsigned int gr_pt = 0; gr_pt < MAX_GRID_PT_; gr_pt++)
   {
@@ -2491,7 +2409,6 @@ void Action_GIST::Print() {
 
   // Write the GIST output file.
   // TODO: Make a data file format?
-  gist_print_write_.Start();
   if (datafile_ != 0) {
     mprintf("\tWriting GIST results for each voxel:\n");
     const char* gistOutputVersion = "v4";
@@ -2522,7 +2439,7 @@ void Action_GIST::Print() {
       datafile_->Printf( (std::string(" Eww_mol_") + solventNames_[i] + "-norm(kcal/mol)").c_str() );
     }
     datafile_->Printf(" Dipole_x-dens(D/A^3) Dipole_y-dens(D/A^3) Dipole_z-dens(D/A^3)"
-                      " Dipole-dens(D/A^3) neighbor-dens(1/A^3) neighbor-norm order-norm\n");
+                      " Dipole-dens(D/A^3) neighbor-dens(1/A^3) neighbor-norm order-norm sw_Acc sw_Don ww_Acc ww_Don\n");
     // Loop over voxels
     DataFilePrinter printer(*datafile_, fltFmt_, intFmt_);
     ProgressBar O_progress( MAX_GRID_PT_ );
@@ -2530,7 +2447,7 @@ void Action_GIST::Print() {
       O_progress.Update( gr_pt );
       size_t i, j, k;
       Esw_->ReverseIndex( gr_pt, i, j, k );
-      Vec3 XYZ = gridBin_->Center( i, j, k );
+      Vec3 XYZ = Esw_->Bin().Center( i, j, k );
       
       printer << gr_pt << XYZ[0] << XYZ[1] << XYZ[2] << N_solvent_[gr_pt];
       for (unsigned int i = 0; i < solventInfo_.unique_elements.size(); ++i) {
@@ -2553,11 +2470,11 @@ void Action_GIST::Print() {
                 << solv_Eww_dens[i][gr_pt] << solv_Eww_norm[i][gr_pt];
       }
       printer << dipolex_dens[gr_pt] << dipoley_dens[gr_pt] << dipolez_dens[gr_pt] 
-              << (*dipole_)[gr_pt] << neighbor_dens[gr_pt] << neighbor_norm[gr_pt] << order_norm[gr_pt];
+              << (*dipole_)[gr_pt] << neighbor_dens[gr_pt] << neighbor_norm[gr_pt] << order_norm[gr_pt]
+              << sw_Acc[gr_pt] << sw_Don[gr_pt] << ww_Acc[gr_pt] << ww_Don[gr_pt];
       printer.newline();
     } // END loop over voxels
   } // END datafile_ not null
-  gist_print_write_.Stop();
 
   // Write water-water interaction energy matrix
   if (ww_Eij_ != 0) {
@@ -2583,11 +2500,6 @@ void Action_GIST::Print() {
   gist_print_.Stop();
   double total = gist_init_.Total() + gist_setup_.Total() +
                  gist_action_.Total() + gist_print_.Total();
-# ifdef MPI
-  // Since translational entropy calc does not occur during print,
-  // need to add it to the total.
-  total += gist_print_TE_.Total();
-# endif
   mprintf("\tGIST timings:\n");
   gist_init_.WriteTiming(1,    "Init:  ", total);
   gist_setup_.WriteTiming(1,   "Setup: ", total);
@@ -2604,14 +2516,9 @@ void Action_GIST::Print() {
   //gist_nonbond_OV_.WriteTiming(3, "OV:", gist_nonbond_.Total());
   gist_euler_.WriteTiming(2,   "Euler:  ", gist_action_.Total());
   gist_dipole_.WriteTiming(2,  "Dipole: ", gist_action_.Total());
-  gist_order_.WriteTiming(2,   "Order:  ", gist_action_.Total());
-  gist_print_.WriteTiming(1,   "Print: ", total);
-  gist_print_write_.WriteTiming(2,"GIST results write:   ", gist_print_.Total()); 
-  gist_print_OE_.WriteTiming(1,   "Orientational Entropy:", total);
-  gist_print_TE_.WriteTiming(1,   "Translational Entropy:", total);
-# ifdef MPI
-  gist_entropy_comm_.WriteTiming(2, "Entropy Arrays Communication:", gist_print_TE_.Total());
-# endif
+  gist_order_.WriteTiming(2,   "Order: ", gist_action_.Total());
+  gist_hbond_.WriteTiming(2,   "Hbond:", gist_action_.Total());
+  gist_print_.WriteTiming(1,   "Print:", total);
   mprintf("TIME:\tTotal: %.4f s\n", total);
   #ifdef CUDA
   this->freeGPUMemory();
@@ -2619,7 +2526,7 @@ void Action_GIST::Print() {
 }
 
 #ifdef CUDA
-void Action_GIST::NonbondCuda(ActionFrame const& frm) {
+void Action_GIST::NonbondCuda(ActionFrame frm) {
   float *recip = NULL;
   float *ucell = NULL;
   int boxinfo;

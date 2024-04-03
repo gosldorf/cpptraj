@@ -1,13 +1,11 @@
 #ifndef INC_ACTION_GIST_H
 #define INC_ACTION_GIST_H
 #include "Action.h"
-#include "GridMover.h"
 #include "ImageOption.h"
 #include "Timer.h"
 #include "EwaldOptions.h"
 #include "CharMask.h"
 #include "GridBin.h"
-#include "PairList.h"
 #include <map>
 #ifdef CUDA
 #include "cuda_kernels/GistCudaSetup.cuh"
@@ -29,7 +27,6 @@ class Action_GIST : public Action {
     #ifdef CUDA
     ~Action_GIST() {delete[] this->solvent_;}
     #endif
-    //~Action_GIST(); // DEBUG MPI
     DispatchObject* Alloc() const { return (DispatchObject*)new Action_GIST(); }
     void Help() const;
   private:
@@ -37,15 +34,14 @@ class Action_GIST : public Action {
     Action::RetType Setup(ActionSetup&);
     Action::RetType DoAction(int, ActionFrame&);
     void Print();
-#   ifdef MPI
-    int SyncAction();
-    int ParallelPostCalc();
-#   endif
+
+    class Site; /// Potential hydrogen bond site. Can be either donor or donor/acceptor.
 
     typedef std::vector<float> Farray;
     typedef std::vector<int> Iarray;
     typedef std::vector<Farray> Xarray;
     typedef std::vector<double> Darray;
+    typedef std::vector<Site> Sarray;
 
     struct SolventInfo
     {
@@ -53,6 +49,20 @@ class Action_GIST : public Action {
         std::vector<std::string> unique_elements;
         std::vector<int> element_count;
     };
+
+    /// functuion for hbond analysis-------
+    inline double Angle(const double*, const double*, const double*, Box const&) const;
+    bool EvalAngle(Site const&,const double*,int,const double*,
+                        Frame const&); // return ture if the distance and angle criteria of hbond is met,
+    void Hbond(Frame const&); // hbond calcution to update the voxel-wise hbond data
+    // IsFON()
+        /** Default criterion for being a hydrogen bond donor/acceptor. */
+    inline bool IsFON(Atom const& atm) {
+        return (atm.Element() == Atom::FLUORINE ||
+        atm.Element() == Atom::OXYGEN ||
+        atm.Element() == Atom::NITROGEN);
+        }
+    //-----------------------------------------
 
     /**
      * @brief Print whitespace delimited data to a CpptrajFile
@@ -90,13 +100,10 @@ class Action_GIST : public Action {
         TextFormat intFmt_;
         bool is_new_line_;
     };
-#   ifdef MPI
-    void sync_Xarray(Xarray&) const;
-#   endif
+
     static inline void Ecalc(double, double, double, NonbondType const&, double&, double&);
     void NonbondEnergy_pme(Frame const&);
     void NonbondEnergy(Frame const&, Topology const&);
-    void Order_PL(Frame const&);
     void Order(Frame const&);
     // void SumEVV();
     void CollectEnergies();
@@ -133,8 +140,6 @@ class Action_GIST : public Action {
     template<typename T>
     std::vector<T> DensityWeightDataSet(const DataSet_3D& ds) const;
 
-    int CalcTranslationalEntropy(unsigned int, unsigned int) const;
-
     int debug_;      ///< Action debug level
     int numthreads_; ///< Number of OpenMP threads
 
@@ -170,7 +175,7 @@ class Action_GIST : public Action {
     // CUDA only functions
     void freeGPUMemory(void);
     void copyToGPU(void);
-    void NonbondCuda(ActionFrame const&);
+    void NonbondCuda(ActionFrame);
 
 #endif
 
@@ -191,18 +196,7 @@ class Action_GIST : public Action {
     double gridspacing_;
     Vec3 gridcntr_;
     int griddim_[3];
-    DataSet_3D* masterGrid_; ///< Grid that will be used to determine voxels for all grids
-    const GridBin* gridBin_; ///< Hold the GridBin class from masterGrid_
-    GridBin borderGrid_;     ///< Hold dims for grid + 1.5 Ang buffer region.
-    Matrix_3x3 borderGridUcell0_; ///< Hold border grid original unit cell (in case of rotation).
-
-    Cpptraj::GridMover mover_; ///< Used to move the master grid if necessary
-    AtomMask moveMask_;        ///< Select atoms used to move the grid if necessary
-
-    PairList pairList_;        ///< Pair list for order calc
-    bool use_PL_;              ///< If true, user wants to use pair list
-    bool PL_active_;           ///< If true, pairlist can be used
-    double PL_cut_;            ///< Pair list cutoff
+    const GridBin* gridBin_;
 
     std::vector<std::string> rigidAtomNames_;
     int rigidAtomIndices_[3]; ///< the 3 atoms that define the orientation of a solvent molecule;
@@ -227,6 +221,12 @@ class Action_GIST : public Action {
     // PME GIST double grid datasets
     DataSet_3D* PME_;       ///< The PME nonbond interaction( charge-charge + vdw) cal for water
     DataSet_3D* U_PME_;     ///< The PME nonbond energy for solute atoms
+
+    // hbond grid dataset
+    DataSet_3D* sw_Don_; //-> For each voxel, number of solute-water hydrogen bond, in which water in this voxel acts as donor
+    DataSet_3D* sw_Acc_; //-> For each voxel, number of solute-water hydrogen bond, in which water in this voxel acts as acceptor
+    DataSet_3D* ww_Don_; //-> For each voxel, number of water-water hydrogen bond, in which water in this voxel acts as donor 
+    DataSet_3D* ww_Acc_; //-> For each voxel, number of water-water hydrogen bond, in which water in this voxel acts as acceptor
 
     SolventInfo solventInfo_;
     std::vector<DataSet_3D*> atomDensitySets_;
@@ -275,6 +275,30 @@ class Action_GIST : public Action {
     Darray E_pme_;     ///< Total nonbond interaction energy(VDW + electrostatic) calculated by PME for water TODO grid?
     Darray U_E_pme_;   ///< Total nonbond interaction energy(VDW + Elec) calculated by PME for solute TODO grid?
 
+    //Add for hydrogen bond analysis-------
+    Darray Nsw_don_; ///< Number of solute-water hbond, in which water acts as donor.*
+    Darray Nsw_acc_; ///< Number of solute-water hbond, in which water acts as acceptor.*
+    Darray Nww_don_; ///< Number of water-water hbond, in which water acts as donor.*
+    Darray Nww_acc_; ///< Number of water-water hbond, in which water acts as acceptor.*
+
+    AtomMask AcceptorMask_; /// Acceptor from solute F/O/N
+    AtomMask Mask_;  /// All atom in the system
+    AtomMask SolventDonorMask_; /// water residues
+    AtomMask SolventAcceptorMask_; /// oxgen atoms in water molecules
+
+    Sarray Both_;         ///< Array of donor sites that can also be acceptors, will be apppended with donor-only solute atom after bothEnd_
+    Iarray Acceptor_;     ///< Array of acceptor-only solute atom indices
+    Sarray SolventSites_; ///< Array of solvent donor/acceptor sites
+    
+    // gemotric criteria for h bond, same as in Action_HydrogenBond
+    double dcut2_; // the distance of A and D atom cutoff squared for Hbod, default 3 Angstrom.
+    double acut_;  // the angle cutoff for A-H-D, default 135 degree
+    unsigned int bothEnd_;   ///< Index in Both_ where donor-only sites begin
+    
+    ///-----------------------------------------
+
+    Vec3 G_max_; ///< Grid max + 1.5 Ang.
+
     // Timing data
     Timer gist_init_;
     Timer gist_setup_;
@@ -289,12 +313,7 @@ class Action_GIST : public Action {
     Timer gist_euler_;
     Timer gist_dipole_;
     Timer gist_order_;
-    Timer gist_print_OE_; ///< Orientational entropy calc timer
-    Timer gist_print_TE_; ///< Translational entropy calc timer
-#   ifdef MPI
-    Timer gist_entropy_comm_; ///< Time needed to communicate the entropy arrays.
-#   endif 
-    Timer gist_print_write_; ///< GIST results file write timer
+    Timer gist_hbond_; 
 
     Topology* CurrentParm_;    ///< Current topology, for energy calc.
     CpptrajFile* datafile_;    ///< GIST output
@@ -318,19 +337,34 @@ class Action_GIST : public Action {
     int max_nwat_;             ///< Max number of waters in any voxel
     int nNnSearchLayers_;      ///< Number of layers of voxels to search for nearest neighbors in the entropy search.
     int n_linear_solvents_;    ///< Count how many near-linear solvents occur during the GIST calculation.*
-#   ifdef DEBUG_GIST
-    CpptrajFile* debugOut_; ///> DEBUG
-#   endif
     bool doOrder_;             ///< If true do the order calc
     bool doEij_;               ///< If true do the i-j energy calc
     bool skipE_;               ///< If true skip the nonbond energy calc
     bool skipS_;               ///< If true does not calculate entropy
+    bool hbond_;               ///< If true do the hbind analysis, defualt is false
     bool exactNnVolume_;       ///< If true use the exact volume equation for the NN entropy
     bool useCom_;              ///< If true use the COM as the molecular center; If false, use the first atom according to rigidAtomIndices.
     bool setupSuccessful_;     ///< Used to skip Print() if setup failed.
-#   ifdef MPI
-    Parallel::Comm trajComm_;  ///< Communicator across trajectory
-#   endif
-    int watCountSubvol_;       ///< Hold nwts; if -1, trans. entropy calc has not been run
 };
 #endif
+class Action_GIST::Site {
+  public:
+    Site() : idx_(-1) {}
+    /// Solute site - heavy atom, hydrogen atom
+    Site(int d, int h) : hlist_(1,h), idx_(d) {}
+    /// Solute site - heavy atom, list of hydrogen atoms
+    Site(int d, Iarray const& H) : hlist_(H), idx_(d) {}
+    /// \return heavy atom index
+    int Idx() const { return idx_; }
+    /// \return number of hydrogen indices
+    unsigned int n_hydrogens()      const { return hlist_.size(); }
+    /// \return true if site is an ion (D atom == H atom)
+    bool IsIon() const { return (hlist_.size()==1 && hlist_[0] == idx_); }
+    /// \return iterator to beginning of hydrogen indices
+    Iarray::const_iterator Hbegin() const { return hlist_.begin(); }
+    /// \return iterator to end of hydrogen indices
+    Iarray::const_iterator Hend()   const { return hlist_.end(); }
+  private:
+    Iarray hlist_; ///< List of hydrogen indices
+    int idx_;      ///< Heavy atom index
+};
