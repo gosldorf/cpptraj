@@ -255,7 +255,6 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
   DataFile* file_Nww_D = 0;
   if (hbond_) {
      /// key word for hbond analysis
-    mprintf("\t in hbond setup 1, line 258\n");
     acut_ = actionArgs.getKeyDouble("angle",135.0);
     acut_ *= Constants::DEGRAD;
     double dcut;  
@@ -265,11 +264,6 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
     SolventAcceptorMask_.SetMaskString(":WAT@O");
     Mask_.SetMaskString(":*");
     AcceptorMask_.SetMaskString(":*");
-    // file_Nsw_A = init.DFL().AddDataFile(prefix_ + "-Nsw_acceptor" +ext_);
-    // file_Nsw_D = init.DFL().AddDataFile(prefix_ + "-Nsw_donor"+ext_);
-    // file_Nww_A = init.DFL().AddDataFile(prefix_ +"-Nww_acceptor" + ext_);
-    // file_Nww_D = init.DFL().AddDataFile(prefix_ +"-Nww_donor" + ext_);
-    mprintf("\t end hbond setup 1, line 272\n");
   }
   // Set Bulk Density 55.5M
   BULK_DENS_ = actionArgs.getKeyDouble("refdens", 0.0334);
@@ -344,15 +338,10 @@ Action::RetType Action_GIST::Init(ArgList& actionArgs, ActionInit& init, int deb
   dipolex_ = AddDatasetAndFile("dipolex", prefix_ + "-dipolex-dens" + ext_, DataSet::GRID_DBL);
   dipoley_ = AddDatasetAndFile("dipoley", prefix_ + "-dipoley-dens" + ext_, DataSet::GRID_DBL);
   dipolez_ = AddDatasetAndFile("dipolez", prefix_ + "-dipolez-dens" + ext_, DataSet::GRID_DBL);
-  mprintf("\t in hbond setup 2, line 348\n");
-  mprintf("\t griddim: %d, %d, %d\n", griddim_[0], griddim_[1], griddim_[2]);
-  sw_Don_ = AddDatasetAndFile("sw-dhbond", prefix_ + "-donor-dens" + ext_, DataSet::GRID_FLT);
-  sw_Acc_ = AddDatasetAndFile("sw-ahbond", prefix_ + "-acceptor-dens" + ext_, DataSet::GRID_FLT);
-  ww_Don_ = AddDatasetAndFile("ww-dhbond", prefix_ + "-donor-dens" + ext_, DataSet::GRID_FLT);
-  ww_Acc_ = AddDatasetAndFile("ww-ahbond", prefix_ + "-acceptor-dens" + ext_, DataSet::GRID_FLT);
-  mprintf("\t end hbond setup 2, line 353\n");
-  mprintf("size checks Esw_ line 354: %d, %d, %d\n", sizeof(Esw_), sizeof(Esw_[0]), sizeof(Esw_)/sizeof(Esw_[0]));
-  mprintf("size checks Nsw_don_ line 355: %d, %d, %d\n", sizeof(Nsw_don_), sizeof(Nsw_don_[0]), sizeof(Nsw_don_)/sizeof(Nsw_don_[0]));
+  sw_Don_ = AddDatasetAndFile("NswDonor", prefix_ + "-swdonor-dens" + ext_, DataSet::GRID_FLT);
+  sw_Acc_ = AddDatasetAndFile("NswAcceptor", prefix_ + "-swacceptor-dens" + ext_, DataSet::GRID_FLT);
+  ww_Don_ = AddDatasetAndFile("NwwDonor", prefix_ + "-wwdonor-dens" + ext_, DataSet::GRID_FLT);
+  ww_Acc_ = AddDatasetAndFile("NwwAcceptor", prefix_ + "-wwacceptor-dens" + ext_, DataSet::GRID_FLT);
     
   if (!Esw_ || !Eww_ || !dTStrans_ || !dTSorient_ || !dTSsix_ || !neighbor_ || !dipole_ || !order_
       || !dipolex_ || !dipoley_ || !dipolez_) {
@@ -699,7 +688,7 @@ Action::RetType Action_GIST::Setup(ActionSetup& setup) {
   if (hbond_){
 
     // --- initianize Hbond analysis
-    mprintf("total atom number [%i] \n", setup.Top().Natom());
+    // mprintf("total atom number [%i] \n", setup.Top().Natom());
     //Mask_ = AtomMask(0, setup.Top().Natom());
     //mprintf("convert Mask_ to char [%s]", Mask_.ConvertToCharMask());
     //mprintf("Mask_ is [%s], number of atom in Mask_ is [%i] \n", Mask_.MaskString(), Mask_.NmaskAtoms());
@@ -790,9 +779,9 @@ Action::RetType Action_GIST::Setup(ActionSetup& setup) {
     Both_.push_back( *site );
 
     // Print solute site stats
-    mprintf("\tAcceptor-only solute atom#: %zu\n", Acceptor_.size());
-    mprintf("\tDonor/acceptor solute sites#: %u\n", bothEnd_);
-    mprintf("\tDonor-on;y solute atoms#: %zu\n", (Both_.size()-bothEnd_));
+    // mprintf("\tAcceptor-only solute atom#: %zu\n", Acceptor_.size());
+    // mprintf("\tDonor/acceptor solute sites#: %u\n", bothEnd_);
+    // mprintf("\tDonor-only solute atoms#: %zu\n", (Both_.size()-bothEnd_));
 
     Sarray::const_iterator END = Both_.begin() + bothEnd_;
   
@@ -805,7 +794,7 @@ Action::RetType Action_GIST::Setup(ActionSetup& setup) {
       hcount += si->n_hydrogens();
     
     }
-    mprintf("\t%u solute hydrogens.\n", hcount);
+    // mprintf("\t%u solute hydrogens.\n", hcount);
 
 
     //------- Solvent Site Setup--------------------
@@ -1508,17 +1497,17 @@ double Action_GIST::Angle(const double* XA, const double* XH, const double* XD, 
 //Perform the hbond analysis and update the voxel-wise hbond data
 void Action_GIST::Hbond(Frame const& frameIn)
 {
-  mprintf("enter hbond function \n");
+  // mprintf("enter hbond function \n");
 
-  double* Nsw_don = &(Nsw_don_[0]);
-  double* Nsw_acc = &(Nsw_acc_[0]);
-  double* Nww_don = &(Nww_don_[0]);
-  double* Nww_acc = &(Nww_acc_[0]);
+  // double* Nsw_don = &(Nsw_don_[0]);
+  // double* Nsw_acc = &(Nsw_acc_[0]);
+  // double* Nww_don = &(Nww_don_[0]);
+  // double* Nww_acc = &(Nww_acc_[0]);
   // Set up imaging info.
 
-  mprintf("size checks Esw_: %d, %d, %d\n", sizeof(Esw_), sizeof(Esw_[0]), sizeof(Esw_)/sizeof(Esw_[0]));
-  mprintf("size checks Nsw_don_: %d, %d, %d\n", sizeof(Nsw_don_), sizeof(Nsw_don_[0]), sizeof(Nsw_don_)/sizeof(Nsw_don_[0]));
-  mprintf("size checks Nsw_don: %d, %d, %d\n", sizeof(Nsw_don), sizeof(Nsw_don[0]), sizeof(Nsw_don)/sizeof(Nsw_don[0]));
+  // mprintf("size checks Esw_: %d, %d, %d\n", sizeof(Esw_), sizeof(Esw_[0]), sizeof(Esw_)/sizeof(Esw_[0]));
+  // mprintf("size checks Nsw_don_: %d, %d, %d\n", sizeof(Nsw_don_), sizeof(Nsw_don_[0]), sizeof(Nsw_don_)/sizeof(Nsw_don_[0]));
+  // mprintf("size checks Nsw_don: %d, %d, %d\n", sizeof(Nsw_don), sizeof(Nsw_don[0]), sizeof(Nsw_don)/sizeof(Nsw_don[0]));
 
  // Loop over all water site in grid and assign the hbond data to each voxel accordingly
 
@@ -1539,7 +1528,7 @@ void Action_GIST::Hbond(Frame const& frameIn)
 
         const double* VXYZ = frameIn.XYZ( Vsite.Idx() );
 
-        mprintf("calculate hbond on solvent site [%i] \n", Vsite.Idx());
+        // mprintf("calculate hbond on solvent site [%i] \n", Vsite.Idx());
       
         
         // Loop over solute sites that can be both donor and acceptor
@@ -1551,25 +1540,27 @@ void Action_GIST::Hbond(Frame const& frameIn)
           double dist2 = DIST2( imageOpt_.ImagingType(), VXYZ, UXYZ, frameIn.BoxCrd() );
           if ( !(dist2 > dcut2_) )
           {
-            mprintf("loop over solute A&D \n");
+            // mprintf("loop over solute A&D \n");
             // Solvent site donor, solute site acceptor
             if(EvalAngle(Vsite, VXYZ, Both_[sidx].Idx(), UXYZ, frameIn))
             {
-              //mprintf("Nsw_don plus 1 \n");
-              Nsw_don[v_voxel] +=1; 
+              // mprintf("Nsw_don plus 1 \n");
+              // Nsw_don[v_voxel] +=1; 
+              sw_Don_->UpdateVoxel(v_voxel, 1.0);
 
             }
             // Solvent site acceptor, solute site donor
             if(EvalAngle(Both_[sidx], UXYZ, Vsite.Idx(), VXYZ, frameIn))
             {
-              //mprintf("Nsw_acc plus 1 \n");
-              Nsw_acc[v_voxel] +=1;
+              // mprintf("Nsw_acc plus 1 \n");
+              // Nsw_acc[v_voxel] +=1;
+              sw_Acc_->UpdateVoxel(v_voxel, 1.0);
             }
           }
         }
         //Loop over solute sites that are donor only
         
-        mprintf("looping over solute donor only \n");
+        // mprintf("looping over solute donor only \n");
         for (unsigned int sidx = bothEnd_; sidx < Both_.size(); sidx++)
         {
           
@@ -1578,12 +1569,13 @@ void Action_GIST::Hbond(Frame const& frameIn)
           if ( !(dist2 > dcut2_) and (EvalAngle(Both_[sidx], UXYZ, Vsite.Idx(), VXYZ, frameIn)))
           // Solvent site acceptor, solute site donor
           { 
-            mprintf("Nsw_acc plus 1 \n");
-            Nsw_acc[v_voxel] +=1;
+            // mprintf("Nsw_acc plus 1 \n");
+            // Nsw_acc[v_voxel] +=1;
+            sw_Acc_->UpdateVoxel(v_voxel, 1.0);
           }
         }
         // Loop over solute sites that are acceptor only
-        mprintf("looping over solute acceptor only \n");
+        // mprintf("looping over solute acceptor only \n");
         for (Iarray::const_iterator a_atom = Acceptor_.begin(); a_atom != Acceptor_.end(); ++a_atom)
         {
           const double* UXYZ = frameIn.XYZ( *a_atom );
@@ -1591,14 +1583,15 @@ void Action_GIST::Hbond(Frame const& frameIn)
           if ( !(dist2 > dcut2_) and EvalAngle(Vsite, VXYZ, *a_atom, UXYZ, frameIn))
           // Solvent site donor, solute site acceptor
           {
-            mprintf("Nsw_don plus 1 \n");
-            Nsw_don[v_voxel] +=1;
+            // mprintf("Nsw_don plus 1 \n");
+            // Nsw_don[v_voxel] +=1;
+            sw_Don_->UpdateVoxel(v_voxel, 1.0);
           }
         } // END loop over solute sites
         
 
         // Loop over other solvent site
-        mprintf("looping over other solvent sites \n");
+        // mprintf("looping over other solvent sites \n");
         
         
         for (int V1_idx = vidx + 1; V1_idx < vidxend; V1_idx++)
@@ -1607,7 +1600,7 @@ void Action_GIST::Hbond(Frame const& frameIn)
           Site const& V1_Site = SolventSites_[V1_idx];
           const double* V1_XYZ = frameIn.XYZ( V1_Site.Idx() );
           int V1_voxel = atom_voxel_[V1_Site.Idx()]; // the voxel index of V1
-          mprintf("second water site V1_Site [%i] \n", V1_Site.Idx());
+          // mprintf("second water site V1_Site [%i] \n", V1_Site.Idx());
 
           double dist2 = DIST2( imageOpt_.ImagingType(), VXYZ, V1_XYZ, frameIn.BoxCrd() );
 
@@ -1621,10 +1614,12 @@ void Action_GIST::Hbond(Frame const& frameIn)
             {
               
               
-              Nww_don[v_voxel] +=1;
+              // Nww_don[v_voxel] +=1;
+              ww_Don_->UpdateVoxel(v_voxel, 1.0);
               if (V1_voxel >=0)
               {
-                Nww_acc[V1_voxel] +=1;
+                // Nww_acc[V1_voxel] +=1;
+                ww_Acc_->UpdateVoxel(V1_voxel, 1.0);
               }
               
             }
@@ -1635,9 +1630,11 @@ void Action_GIST::Hbond(Frame const& frameIn)
               
               if (V1_voxel >=0)
               {
-                Nww_don[V1_voxel] +=1;
+                // Nww_don[V1_voxel] +=1;
+                ww_Don_->UpdateVoxel(V1_voxel, 1.0);
               }
-              Nww_acc[v_voxel] +=1;
+              // Nww_acc[v_voxel] +=1;
+              ww_Acc_->UpdateVoxel(v_voxel, 1.0);
               
             }
             
@@ -1645,7 +1642,7 @@ void Action_GIST::Hbond(Frame const& frameIn)
           
                 
         }
-        mprintf("for this solvent, finished the looping for other solvent site \n");
+        // mprintf("for this solvent, finished the looping for other solvent site \n");
       }
     } 
 }
@@ -1653,7 +1650,7 @@ void Action_GIST::Hbond(Frame const& frameIn)
 /** GIST action */
 Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
   gist_action_.Start();
-  mprintf("in action, line 1652\n");
+  // mprintf("in action, line 1652\n");
   NFRAME_++;
   // TODO only !skipE?
   N_ON_GRID_ = 0;
@@ -1693,7 +1690,7 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
   // CUDA necessary information
 
   Vec3 const& Origin = gridBin_->GridOrigin();
-  mprintf("in action, line 1692\n");
+  // mprintf("in action, line 1692\n");
   // Loop over each solvent molecule
   for (Topology::mol_iterator mol = CurrentParm_->MolStart(); mol != CurrentParm_->MolEnd(); ++mol)
   {
@@ -1926,12 +1923,12 @@ Action::RetType Action_GIST::DoAction(int frameNum, ActionFrame& frm) {
   gist_order_.Stop();
 # endif
   // Do Hbond analysis
-  mprintf("doing Hbond anaylsis: \n");
+  // mprintf("doing Hbond anaylsis: \n");
   gist_hbond_.Start();
 
   if (hbond_) Hbond( frm.Frm());
   gist_hbond_.Stop();
-  mprintf("hbond done!!\n");
+  // mprintf("hbond done!!\n");
   // Do nonbond energy calc if not skipping energy
   gist_nonbond_.Start();
   if (!skipE_) {
